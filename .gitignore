@@ -72,13 +72,13 @@ lib/
 cmake_modules/
 cmake-build-debug/
 
-ExecMean.txt
+ExecMean*.txt
 SessionInfo.txt
 Results_Euroc.txt
 LBA_Stats.txt
-LocalMapTimeStats.txt
-TrackLocalMapStats.txt
-TrackingTimeStats.txt
+LocalMapTimeStats*.txt
+TrackLocalMapStats*.txt
+TrackingTimeStats*.txt
 time*
 Time*
 Table_Euroc
@@ -91,3 +91,7 @@ my_settings.txt
 borrar/*
 
 */ExecMean.txt
+
+
+
+timing_results/

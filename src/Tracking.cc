@@ -266,6 +266,12 @@ void Tracking::PrintTimeStats()
     TrackStats2File();
     LocalMapStats2File();
 
+    #ifdef REGISTER_TIMES_SUBSTAGE
+    if (mpORBextractorLeft) {
+        mpORBextractorLeft->WriteTimingsCSV("ORBExtractorTimings.txt");
+    }
+	#endif
+
 
     ofstream f;
     f.open("ExecMean.txt");

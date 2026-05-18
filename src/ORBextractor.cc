@@ -61,6 +61,9 @@
 
 #include "ORBextractor.h"
 
+//includes for timing
+#include <chrono>
+#include <fstream>
 
 using namespace cv;
 using namespace std;
@@ -780,9 +783,14 @@ namespace ORB_SLAM3
 
     void ORBextractor::ComputeKeyPointsOctTree(vector<vector<KeyPoint> >& allKeypoints)
     {
-        allKeypoints.resize(nlevels);
+	allKeypoints.resize(nlevels);
 
         const float W = 35;
+
+		#ifdef REGISTER_TIMES_SUBSTAGE
+			double fast_us_accum = 0.0;
+			double octtree_us_accum = 0.0;
+		#endif
 
         for (int level = 0; level < nlevels; ++level)
         {
@@ -801,6 +809,10 @@ namespace ORB_SLAM3
             const int nRows = height/W;
             const int wCell = ceil(width/nCols);
             const int hCell = ceil(height/nRows);
+
+			#ifdef REGISTER_TIMES_SUBSTAGE
+			auto t_fast_start = std::chrono::high_resolution_clock::now();
+			#endif
 
             for(int i=0; i<nRows; i++)
             {
@@ -871,11 +883,21 @@ namespace ORB_SLAM3
                 }
             }
 
+            #ifdef REGISTER_TIMES_SUBSTAGE
+			auto t_fast_end = std::chrono::high_resolution_clock::now();
+			#endif
+
             vector<KeyPoint> & keypoints = allKeypoints[level];
             keypoints.reserve(nfeatures);
 
             keypoints = DistributeOctTree(vToDistributeKeys, minBorderX, maxBorderX,
                                           minBorderY, maxBorderY,mnFeaturesPerLevel[level], level);
+
+            #ifdef REGISTER_TIMES_SUBSTAGE
+			auto t_octtree_end = std::chrono::high_resolution_clock::now();
+			fast_us_accum += std::chrono::duration<double, std::micro>(t_fast_end - t_fast_start).count();
+			octtree_us_accum += std::chrono::duration<double, std::micro>(t_octtree_end - t_fast_end).count();
+			#endif
 
             const int scaledPatchSize = PATCH_SIZE*mvScaleFactor[level];
 
@@ -890,9 +912,20 @@ namespace ORB_SLAM3
             }
         }
 
+	#ifdef REGISTER_TIMES_SUBSTAGE
+	auto t_orient_start = std::chrono::high_resolution_clock::now();
+	#endif
+
         // compute orientations
         for (int level = 0; level < nlevels; ++level)
             computeOrientation(mvImagePyramid[level], allKeypoints[level], umax);
+
+	#ifdef REGISTER_TIMES_SUBSTAGE
+	auto t_orient_end = std::chrono::high_resolution_clock::now();
+	vdFAST_us.push_back(fast_us_accum);
+	vdOctTree_us.push_back(octtree_us_accum);
+	vdOrient_us.push_back(std::chrono::duration<double, std::micro>(t_orient_end - t_orient_start).count());
+	#endif
     }
 
     void ORBextractor::ComputeKeyPointsOld(std::vector<std::vector<KeyPoint> > &allKeypoints)
@@ -1093,12 +1126,26 @@ namespace ORB_SLAM3
         Mat image = _image.getMat();
         assert(image.type() == CV_8UC1 );
 
+        #ifdef REGISTER_TIMES_SUBSTAGE
+		auto t_pyr_start = std::chrono::high_resolution_clock::now();
+		#endif
+		
         // Pre-compute the scale pyramid
         ComputePyramid(image);
+
+        #ifdef REGISTER_TIMES_SUBSTAGE
+        auto t_pyr_end = std::chrono::high_resolution_clock::now();
+        vdPyramid_us.push_back(std::chrono::duration<double, std::micro>(t_pyr_end - t_pyr_start).count());
+		#endif
 
         vector < vector<KeyPoint> > allKeypoints;
         ComputeKeyPointsOctTree(allKeypoints);
         //ComputeKeyPointsOld(allKeypoints);
+
+
+        #ifdef REGISTER_TIMES_SUBSTAGE
+		auto t_desc_start = std::chrono::high_resolution_clock::now();
+		#endif
 
         Mat descriptors;
 
@@ -1163,6 +1210,14 @@ namespace ORB_SLAM3
                 i++;
             }
         }
+
+        #ifdef REGISTER_TIMES_SUBSTAGE
+		auto t_desc_end = std::chrono::high_resolution_clock::now();
+		vdDescriptors_us.push_back(std::chrono::duration<double, std::micro>(t_desc_end - t_desc_start).count());
+		#endif
+
+
+
         //cout << "[ORBextractor]: extracted " << _keypoints.size() << " KeyPoints" << endl;
         return monoIndex;
     }
@@ -1193,5 +1248,23 @@ namespace ORB_SLAM3
         }
 
     }
+    
+    #ifdef REGISTER_TIMES_SUBSTAGE
+    void ORBextractor::WriteTimingsCSV(const std::string& filename)
+    {
+        std::ofstream f(filename);
+        f << "#Pyramid_us,FAST_us,OctTree_us,Orient_us,Descriptors_us\n";
+        const size_t N = vdFAST_us.size();
+        for (size_t i = 0; i < N; ++i) {
+            const double pyr  = (i < vdPyramid_us.size())     ? vdPyramid_us[i]     : 0.0;
+            const double fast = (i < vdFAST_us.size())        ? vdFAST_us[i]        : 0.0;
+            const double oct  = (i < vdOctTree_us.size())     ? vdOctTree_us[i]     : 0.0;
+            const double ori  = (i < vdOrient_us.size())      ? vdOrient_us[i]      : 0.0;
+            const double dsc  = (i < vdDescriptors_us.size()) ? vdDescriptors_us[i] : 0.0;
+            f << pyr << "," << fast << "," << oct << "," << ori << "," << dsc << "\n";
+        }
+        f.close();
+    }
+	#endif
 
 } //namespace ORB_SLAM

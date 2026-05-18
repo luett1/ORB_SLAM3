@@ -23,6 +23,10 @@
 #include <list>
 #include <opencv2/opencv.hpp>
 
+//timing includes to measure each part of ORB
+#include <list>
+#include <string>
+
 
 namespace ORB_SLAM3
 {
@@ -57,6 +61,18 @@ public:
     int operator()( cv::InputArray _image, cv::InputArray _mask,
                     std::vector<cv::KeyPoint>& _keypoints,
                     cv::OutputArray _descriptors, std::vector<int> &vLappingArea);
+
+	
+	#ifdef REGISTER_TIMES_SUBSTAGE
+	// Per-stage timing accumulators (microseconds, one entry per frame call)
+	std::vector<double> vdPyramid_us;
+	std::vector<double> vdFAST_us;
+	std::vector<double> vdOctTree_us;
+	std::vector<double> vdOrient_us;
+	std::vector<double> vdDescriptors_us;
+
+	void WriteTimingsCSV(const std::string& filename);
+	#endif
 
     int inline GetLevels(){
         return nlevels;}
