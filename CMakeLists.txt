@@ -393,6 +393,15 @@ endif()
 option(REGISTER_TIMES "Enable ORB-SLAM3 built-in per-stage timing (Tracking::PrintTimeStats)" ON)
 option(REGISTER_TIMES_SUBSTAGE "Enable per-stage timing inside ORBextractor (writes ORBExtractorTimings.txt)" ON)
 
+# Substage timing depends on the parent: the WriteTimingsCSV dump is only reached
+# via Tracking::PrintTimeStats(), whose call site is gated by REGISTER_TIMES.
+# Enabling the REGISTER_TIMES_SUBSTAGE will overwrite a disabled REGISTER_TIMES
+if(REGISTER_TIMES_SUBSTAGE AND NOT REGISTER_TIMES)
+    message(STATUS "REGISTER_TIMES_SUBSTAGE requires REGISTER_TIMES; enabling REGISTER_TIMES")
+    set(REGISTER_TIMES ON CACHE BOOL
+        "Enable ORB-SLAM3 built-in per-stage timing (Tracking::PrintTimeStats)" FORCE)
+endif()
+
 if(REGISTER_TIMES)
     add_definitions(-DREGISTER_TIMES)
     message(STATUS "REGISTER_TIMES enabled")
