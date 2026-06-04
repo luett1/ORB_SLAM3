@@ -95,3 +95,8 @@ borrar/*
 
 
 timing_results/
+
+
+# ignore run.sh. its just a file for setting up multiple ORB_SLAM3 runs,
+# not a part of orbslam itself
+/run.sh
