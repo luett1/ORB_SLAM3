@@ -1,5 +1,13 @@
 # ORB-SLAM3
 
+### V1.0.1, May 18th, 2025
+Added a way to measure Sub-Stage ORB Timings. When enabled, an additional timing file, `ORBExtractorTimings.txt`, will be created that includes the timings in microseconds of:
+- Pyramid Building
+- FAST
+- OctTree
+- Orientation
+- Descriptors
+
 ### V1.0, December 22th, 2021
 **Authors:** Carlos Campos, Richard Elvira, Juan J. Gómez Rodríguez, [José M. M. Montiel](http://webdiis.unizar.es/~josemari/), [Juan D. Tardos](http://webdiis.unizar.es/~jdtardos/).
 
