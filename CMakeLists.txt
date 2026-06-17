@@ -391,12 +391,18 @@ endif()
 
 # Timing instrumentation flags
 option(USE_HW_ACCEL "Enable KR260 AXI-DMA hardware acceleration in ORBextractor" OFF)
+option(USE_HW_ACCEL_TRACE "Enable verbose KR260 hardware accelerator trace logging" OFF)
 option(REGISTER_TIMES "Enable ORB-SLAM3 built-in per-stage timing (Tracking::PrintTimeStats)" ON)
 option(REGISTER_TIMES_SUBSTAGE "Enable per-stage timing inside ORBextractor (writes ORBExtractorTimings.txt)" ON)
 
 if(USE_HW_ACCEL)
     add_definitions(-DUSE_HW_ACCEL)
     message(STATUS "USE_HW_ACCEL enabled")
+endif()
+
+if(USE_HW_ACCEL_TRACE)
+    add_definitions(-DUSE_HW_ACCEL_TRACE)
+    message(STATUS "USE_HW_ACCEL_TRACE enabled")
 endif()
 
 # Substage timing depends on the parent: the WriteTimingsCSV dump is only reached

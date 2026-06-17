@@ -321,11 +321,13 @@ namespace top {
             if(outLen < kRecordBytes)
                 throw runtime_error("mapped udmabuf1 is too small for one output record");
 
+#ifdef USE_HW_ACCEL_TRACE
             if(traceCount_ < 20)
                 cerr << "[USE_HW_ACCEL] begin level=" << level
                      << ", image=" << image.cols << "x" << image.rows
                      << ", inLen=" << inLen
                      << ", outLen=" << outLen << endl;
+#endif
 
             topRegs_.write32(top::CTRL, top::CtrlSoftReset);
             this_thread::sleep_for(chrono::milliseconds(1));
@@ -335,13 +337,17 @@ namespace top {
             dmaRegs_.write32(dma::S2MM_DMACR, dma::DmacrReset);
             this_thread::sleep_for(chrono::milliseconds(10));
 
+#ifdef USE_HW_ACCEL_TRACE
             if(traceCount_ < 20)
                 cerr << "[USE_HW_ACCEL] reset done level=" << level << endl;
+#endif
 
             CopyImageToMappedBytes(inMap_.bytes(), image);
 
+#ifdef USE_HW_ACCEL_TRACE
             if(traceCount_ < 20)
                 cerr << "[USE_HW_ACCEL] input copied level=" << level << endl;
+#endif
 
             topRegs_.write32(top::WIDTH, static_cast<uint32_t>(image.cols));
             topRegs_.write32(top::HEIGHT, static_cast<uint32_t>(image.rows));
@@ -360,8 +366,10 @@ namespace top {
             dmaRegs_.write32(dma::MM2S_SA_MSB, 0);
             dmaRegs_.write32(dma::MM2S_LENGTH, static_cast<uint32_t>(inLen));
 
+#ifdef USE_HW_ACCEL_TRACE
             if(traceCount_ < 20)
                 cerr << "[USE_HW_ACCEL] transfer started level=" << level << endl;
+#endif
 
             const chrono::steady_clock::time_point start = chrono::steady_clock::now();
             bool dmaError = false;
@@ -399,7 +407,9 @@ namespace top {
 
             const uint32_t finalStatus = topRegs_.read32(top::STATUS);
             const uint32_t kpCount = topRegs_.read32(top::KPCOUNT);
+#ifdef USE_HW_ACCEL_TRACE
             const uint32_t dropCount = topRegs_.read32(top::DROPCNT);
+#endif
 
             topRegs_.write32(top::CTRL, 0);
 
@@ -412,6 +422,7 @@ namespace top {
                 throw runtime_error("TOP cfg_error set");
             if((finalStatus & top::StatusOverflow) != 0)
                 throw runtime_error("TOP overflow set");
+#ifdef USE_HW_ACCEL_TRACE
             if(dropCount != 0)
             {
                 if(dropWarningCount_ < 20)
@@ -425,6 +436,7 @@ namespace top {
                 }
                 ++dropWarningCount_;
             }
+#endif
 
             const size_t sentinelOffset = static_cast<size_t>(kpCount) * kRecordBytes;
             if(sentinelOffset + kRecordBytes > outLen)
@@ -461,12 +473,14 @@ namespace top {
                 rawKeypoints.push_back(keypoint);
             }
 
+#ifdef USE_HW_ACCEL_TRACE
             if(traceCount_ < 20)
                 cerr << "[USE_HW_ACCEL] done level=" << level
                      << ", KPCOUNT=" << kpCount
                      << ", kept=" << rawKeypoints.size()
                      << ", DROPCNT=" << dropCount << endl;
             ++traceCount_;
+#endif
         }
 
     private:
@@ -485,8 +499,10 @@ namespace top {
         Mapping inMap_;
         Mapping outMap_;
         mutex mutex_;
+#ifdef USE_HW_ACCEL_TRACE
         uint32_t dropWarningCount_ = 0;
         uint32_t traceCount_ = 0;
+#endif
     };
 
     OrbHwAccelerator& GetOrbHwAccelerator()
