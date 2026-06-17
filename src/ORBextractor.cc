@@ -104,6 +104,8 @@ namespace {
 
     const size_t kDmaMapSize = 0x10000;
     const size_t kTopMapSize = 0x1000;
+    const size_t kHwInputMapBytes = 512 * 1024;
+    const size_t kHwOutputMapBytes = 256 * 1024;
     const size_t kRecordBytes = 16;
     const uint32_t kExpectedTopId = 0xC0DE0001u;
 
@@ -272,19 +274,21 @@ namespace top {
               inPhys_(ReadU64Auto(kInPhysPath)),
               outPhys_(ReadU64Auto(kOutPhysPath)),
               inSize_(static_cast<size_t>(ReadU64Auto(kInSizePath))),
-              outSize_(static_cast<size_t>(ReadU64Auto(kOutSizePath)))
+              outSize_(static_cast<size_t>(ReadU64Auto(kOutSizePath))),
+              inMapSize_(min(inSize_, kHwInputMapBytes)),
+              outMapSize_(min(outSize_, kHwOutputMapBytes))
         {
-            if(inSize_ == 0 || outSize_ < kRecordBytes)
+            if(inMapSize_ == 0 || outMapSize_ < kRecordBytes)
                 throw runtime_error("invalid u-dma-buf size");
-            if((outSize_ % kRecordBytes) != 0)
-                throw runtime_error("udmabuf1 size must be a multiple of 16 bytes");
+            if((outMapSize_ % kRecordBytes) != 0)
+                throw runtime_error("hardware output map size must be a multiple of 16 bytes");
             if(inPhys_ > 0xFFFFFFFFull || outPhys_ > 0xFFFFFFFFull)
                 throw runtime_error("u-dma-buf physical address is above the 32-bit DMA range");
 
             dmaRegs_.map(dmaFd_.get(), kDmaMapSize);
             topRegs_.map(topFd_.get(), kTopMapSize);
-            inMap_.map(inFd_.get(), inSize_);
-            outMap_.map(outFd_.get(), outSize_);
+            inMap_.map(inFd_.get(), inMapSize_);
+            outMap_.map(outFd_.get(), outMapSize_);
 
             const uint32_t topId = topRegs_.read32(top::ID);
             if(topId != kExpectedTopId)
@@ -300,11 +304,17 @@ namespace top {
                 throw runtime_error("hardware accelerator expects CV_8UC1 images");
 
             const size_t inLen = static_cast<size_t>(image.cols) * static_cast<size_t>(image.rows);
-            const size_t outLen = outSize_;
-            if(inLen > inSize_)
-                throw runtime_error("pyramid level exceeds udmabuf0 size");
+            const size_t outLen = outMapSize_;
+            if(inLen > inMapSize_)
+                throw runtime_error("pyramid level exceeds mapped udmabuf0 size");
             if(outLen < kRecordBytes)
-                throw runtime_error("udmabuf1 is too small for one output record");
+                throw runtime_error("mapped udmabuf1 is too small for one output record");
+
+            if(traceCount_ < 20)
+                cerr << "[USE_HW_ACCEL] begin level=" << level
+                     << ", image=" << image.cols << "x" << image.rows
+                     << ", inLen=" << inLen
+                     << ", outLen=" << outLen << endl;
 
             for(int row = 0; row < image.rows; ++row)
                 memcpy(inMap_.bytes() + static_cast<size_t>(row) * image.cols,
@@ -434,6 +444,13 @@ namespace top {
                 keypoint.angle = HardwareAngleToDegrees(angleQ24);
                 rawKeypoints.push_back(keypoint);
             }
+
+            if(traceCount_ < 20)
+                cerr << "[USE_HW_ACCEL] done level=" << level
+                     << ", KPCOUNT=" << kpCount
+                     << ", kept=" << rawKeypoints.size()
+                     << ", DROPCNT=" << dropCount << endl;
+            ++traceCount_;
         }
 
     private:
@@ -445,12 +462,15 @@ namespace top {
         uint64_t outPhys_;
         size_t inSize_;
         size_t outSize_;
+        size_t inMapSize_;
+        size_t outMapSize_;
         Mapping dmaRegs_;
         Mapping topRegs_;
         Mapping inMap_;
         Mapping outMap_;
         mutex mutex_;
         uint32_t dropWarningCount_ = 0;
+        uint32_t traceCount_ = 0;
     };
 
     OrbHwAccelerator& GetOrbHwAccelerator()
