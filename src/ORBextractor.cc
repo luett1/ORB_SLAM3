@@ -56,6 +56,7 @@
 #include <opencv2/highgui/highgui.hpp>
 #include <opencv2/features2d/features2d.hpp>
 #include <opencv2/imgproc/imgproc.hpp>
+#include <algorithm>
 #include <vector>
 #include <iostream>
 
@@ -64,6 +65,20 @@
 //includes for timing
 #include <chrono>
 #include <fstream>
+
+#ifdef USE_HW_ACCEL
+#include <cerrno>
+#include <cstdint>
+#include <cstring>
+#include <fcntl.h>
+#include <mutex>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <sys/mman.h>
+#include <thread>
+#include <unistd.h>
+#endif
 
 using namespace cv;
 using namespace std;
@@ -75,6 +90,365 @@ namespace ORB_SLAM3
     const int HALF_PATCH_SIZE = 15;
     const int EDGE_THRESHOLD = 19;
 
+#ifdef USE_HW_ACCEL
+namespace {
+
+    const char* kDmaDev = "/dev/uio4";
+    const char* kTopDev = "/dev/uio5";
+    const char* kInDev = "/dev/udmabuf0";
+    const char* kOutDev = "/dev/udmabuf1";
+    const char* kInPhysPath = "/sys/class/u-dma-buf/udmabuf0/phys_addr";
+    const char* kOutPhysPath = "/sys/class/u-dma-buf/udmabuf1/phys_addr";
+    const char* kInSizePath = "/sys/class/u-dma-buf/udmabuf0/size";
+    const char* kOutSizePath = "/sys/class/u-dma-buf/udmabuf1/size";
+
+    const size_t kDmaMapSize = 0x10000;
+    const size_t kTopMapSize = 0x1000;
+    const size_t kRecordBytes = 16;
+    const uint32_t kExpectedTopId = 0xC0DE0001u;
+
+namespace dma {
+    const uint32_t MM2S_DMACR = 0x00;
+    const uint32_t MM2S_DMASR = 0x04;
+    const uint32_t MM2S_SA = 0x18;
+    const uint32_t MM2S_SA_MSB = 0x1C;
+    const uint32_t MM2S_LENGTH = 0x28;
+
+    const uint32_t S2MM_DMACR = 0x30;
+    const uint32_t S2MM_DMASR = 0x34;
+    const uint32_t S2MM_DA = 0x48;
+    const uint32_t S2MM_DA_MSB = 0x4C;
+    const uint32_t S2MM_LENGTH = 0x58;
+
+    const uint32_t DmacrRunStop = 0x00000001;
+    const uint32_t DmacrReset = 0x00000004;
+    const uint32_t DmacrIocIrqEn = 0x00001000;
+    const uint32_t DmasrIocIrq = 0x00001000;
+    const uint32_t DmasrErrMask = 0x00000070;
+}  // namespace dma
+
+namespace top {
+    const uint32_t CTRL = 0x00;
+    const uint32_t STATUS = 0x04;
+    const uint32_t WIDTH = 0x08;
+    const uint32_t HEIGHT = 0x0C;
+    const uint32_t KPCOUNT = 0x14;
+    const uint32_t DROPCNT = 0x18;
+    const uint32_t ID = 0x1C;
+
+    const uint32_t CtrlEnable = 0x00000001;
+    const uint32_t CtrlSoftReset = 0x00000002;
+    const uint32_t StatusDone = 0x00000002;
+    const uint32_t StatusOverflow = 0x00000004;
+    const uint32_t StatusCfgError = 0x00000008;
+}  // namespace top
+
+    class Fd
+    {
+    public:
+        explicit Fd(const char* path) : fd_(::open(path, O_RDWR | O_SYNC))
+        {
+            if(fd_ < 0)
+                throw runtime_error(string("open failed for ") + path + ": " + strerror(errno));
+        }
+
+        ~Fd()
+        {
+            if(fd_ >= 0)
+                ::close(fd_);
+        }
+
+        Fd(const Fd&) = delete;
+        Fd& operator=(const Fd&) = delete;
+
+        int get() const { return fd_; }
+
+    private:
+        int fd_;
+    };
+
+    class Mapping
+    {
+    public:
+        Mapping() : data_(nullptr), size_(0) {}
+
+        ~Mapping()
+        {
+            if(data_)
+                ::munmap(data_, size_);
+        }
+
+        Mapping(const Mapping&) = delete;
+        Mapping& operator=(const Mapping&) = delete;
+
+        void map(int fd, size_t size)
+        {
+            void* ptr = ::mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if(ptr == MAP_FAILED)
+                throw runtime_error(string("mmap failed: ") + strerror(errno));
+
+            data_ = static_cast<uint8_t*>(ptr);
+            size_ = size;
+        }
+
+        uint8_t* bytes() { return data_; }
+        const uint8_t* bytes() const { return data_; }
+        size_t size() const { return size_; }
+
+        uint32_t read32(uint32_t byteOffset) const
+        {
+            const volatile uint32_t* regs = reinterpret_cast<const volatile uint32_t*>(data_);
+            return regs[byteOffset / 4];
+        }
+
+        void write32(uint32_t byteOffset, uint32_t value)
+        {
+            volatile uint32_t* regs = reinterpret_cast<volatile uint32_t*>(data_);
+            regs[byteOffset / 4] = value;
+        }
+
+    private:
+        uint8_t* data_;
+        size_t size_;
+    };
+
+    uint64_t ReadU64Auto(const string& path)
+    {
+        ifstream input(path.c_str());
+        if(!input)
+            throw runtime_error("failed to open " + path);
+
+        string value;
+        input >> value;
+        return stoull(value, nullptr, 0);
+    }
+
+    string Hex32(uint32_t value)
+    {
+        ostringstream stream;
+        stream << "0x" << hex << value;
+        return stream.str();
+    }
+
+    uint16_t ReadLe16(const uint8_t* data)
+    {
+        return static_cast<uint16_t>(data[0]) |
+               static_cast<uint16_t>(static_cast<uint16_t>(data[1]) << 8);
+    }
+
+    uint32_t ReadLe32(const uint8_t* data)
+    {
+        return static_cast<uint32_t>(data[0]) |
+               (static_cast<uint32_t>(data[1]) << 8) |
+               (static_cast<uint32_t>(data[2]) << 16) |
+               (static_cast<uint32_t>(data[3]) << 24);
+    }
+
+    void FillMappedBytes(uint8_t* dst, size_t len, uint8_t value)
+    {
+        volatile uint8_t* p = dst;
+        for(size_t i = 0; i < len; ++i)
+            p[i] = value;
+    }
+
+    float HardwareAngleToDegrees(int32_t angleQ24)
+    {
+        float degrees = static_cast<float>(angleQ24) * (360.0f / 8388608.0f);
+        if(degrees < 0.0f)
+            degrees += 360.0f;
+        if(degrees >= 360.0f)
+            degrees -= 360.0f;
+        return degrees;
+    }
+
+    class OrbHwAccelerator
+    {
+    public:
+        OrbHwAccelerator()
+            : dmaFd_(kDmaDev),
+              topFd_(kTopDev),
+              inFd_(kInDev),
+              outFd_(kOutDev),
+              inPhys_(ReadU64Auto(kInPhysPath)),
+              outPhys_(ReadU64Auto(kOutPhysPath)),
+              inSize_(static_cast<size_t>(ReadU64Auto(kInSizePath))),
+              outSize_(static_cast<size_t>(ReadU64Auto(kOutSizePath)))
+        {
+            if(inSize_ == 0 || outSize_ < kRecordBytes)
+                throw runtime_error("invalid u-dma-buf size");
+            if((outSize_ % kRecordBytes) != 0)
+                throw runtime_error("udmabuf1 size must be a multiple of 16 bytes");
+            if(inPhys_ > 0xFFFFFFFFull || outPhys_ > 0xFFFFFFFFull)
+                throw runtime_error("u-dma-buf physical address is above the 32-bit DMA range");
+
+            dmaRegs_.map(dmaFd_.get(), kDmaMapSize);
+            topRegs_.map(topFd_.get(), kTopMapSize);
+            inMap_.map(inFd_.get(), inSize_);
+            outMap_.map(outFd_.get(), outSize_);
+
+            const uint32_t topId = topRegs_.read32(top::ID);
+            if(topId != kExpectedTopId)
+                throw runtime_error("unexpected TOP build ID: " + Hex32(topId));
+        }
+
+        void RunLevel(const Mat& image, vector<KeyPoint>& rawKeypoints,
+                      int minBorderX, int maxBorderX, int minBorderY, int maxBorderY)
+        {
+            lock_guard<mutex> lock(mutex_);
+
+            if(image.type() != CV_8UC1)
+                throw runtime_error("hardware accelerator expects CV_8UC1 images");
+
+            const size_t inLen = static_cast<size_t>(image.cols) * static_cast<size_t>(image.rows);
+            const size_t outLen = outSize_;
+            if(inLen > inSize_)
+                throw runtime_error("pyramid level exceeds udmabuf0 size");
+            if(outLen < kRecordBytes)
+                throw runtime_error("udmabuf1 is too small for one output record");
+
+            for(int row = 0; row < image.rows; ++row)
+                memcpy(inMap_.bytes() + static_cast<size_t>(row) * image.cols,
+                       image.ptr<uchar>(row), static_cast<size_t>(image.cols));
+
+            FillMappedBytes(outMap_.bytes(), outLen, 0xA5);
+
+            topRegs_.write32(top::CTRL, top::CtrlSoftReset);
+            this_thread::sleep_for(chrono::milliseconds(1));
+            topRegs_.write32(top::CTRL, 0);
+
+            dmaRegs_.write32(dma::MM2S_DMACR, dma::DmacrReset);
+            dmaRegs_.write32(dma::S2MM_DMACR, dma::DmacrReset);
+            this_thread::sleep_for(chrono::milliseconds(10));
+
+            topRegs_.write32(top::WIDTH, static_cast<uint32_t>(image.cols));
+            topRegs_.write32(top::HEIGHT, static_cast<uint32_t>(image.rows));
+
+            dmaRegs_.write32(dma::S2MM_DMACR, dma::DmacrRunStop | dma::DmacrIocIrqEn);
+            dmaRegs_.write32(dma::MM2S_DMACR, dma::DmacrRunStop | dma::DmacrIocIrqEn);
+            this_thread::sleep_for(chrono::milliseconds(1));
+
+            dmaRegs_.write32(dma::S2MM_DA, static_cast<uint32_t>(outPhys_));
+            dmaRegs_.write32(dma::S2MM_DA_MSB, 0);
+            dmaRegs_.write32(dma::S2MM_LENGTH, static_cast<uint32_t>(outLen));
+
+            topRegs_.write32(top::CTRL, top::CtrlEnable);
+
+            dmaRegs_.write32(dma::MM2S_SA, static_cast<uint32_t>(inPhys_));
+            dmaRegs_.write32(dma::MM2S_SA_MSB, 0);
+            dmaRegs_.write32(dma::MM2S_LENGTH, static_cast<uint32_t>(inLen));
+
+            const chrono::steady_clock::time_point start = chrono::steady_clock::now();
+            bool dmaError = false;
+            bool timedOut = false;
+            uint32_t errorMm2sStatus = 0;
+            uint32_t errorS2mmStatus = 0;
+            while(true)
+            {
+                const uint32_t mm2sStatus = dmaRegs_.read32(dma::MM2S_DMASR);
+                const uint32_t s2mmStatus = dmaRegs_.read32(dma::S2MM_DMASR);
+                const uint32_t topStatus = topRegs_.read32(top::STATUS);
+
+                if(((mm2sStatus | s2mmStatus) & dma::DmasrErrMask) != 0)
+                {
+                    dmaError = true;
+                    errorMm2sStatus = mm2sStatus;
+                    errorS2mmStatus = s2mmStatus;
+                    break;
+                }
+
+                const bool mm2sDone = (mm2sStatus & dma::DmasrIocIrq) != 0;
+                const bool s2mmDone = (s2mmStatus & dma::DmasrIocIrq) != 0;
+                const bool topDone = (topStatus & top::StatusDone) != 0;
+                if(mm2sDone && s2mmDone && topDone)
+                    break;
+
+                if(chrono::steady_clock::now() - start > chrono::seconds(2))
+                {
+                    timedOut = true;
+                    break;
+                }
+
+                this_thread::sleep_for(chrono::milliseconds(1));
+            }
+
+            const uint32_t finalStatus = topRegs_.read32(top::STATUS);
+            const uint32_t kpCount = topRegs_.read32(top::KPCOUNT);
+            const uint32_t dropCount = topRegs_.read32(top::DROPCNT);
+
+            topRegs_.write32(top::CTRL, 0);
+
+            if(dmaError)
+                throw runtime_error("AXI DMA error: MM2S=" + Hex32(errorMm2sStatus) +
+                                    " S2MM=" + Hex32(errorS2mmStatus));
+            if(timedOut)
+                throw runtime_error("hardware accelerator timed out");
+            if((finalStatus & top::StatusCfgError) != 0)
+                throw runtime_error("TOP cfg_error set");
+            if((finalStatus & top::StatusOverflow) != 0)
+                throw runtime_error("TOP overflow set");
+            if(dropCount != 0)
+                throw runtime_error("TOP drop count is nonzero: " + to_string(dropCount));
+
+            const size_t sentinelOffset = static_cast<size_t>(kpCount) * kRecordBytes;
+            if(sentinelOffset + kRecordBytes > outLen)
+                throw runtime_error("TOP KPCOUNT exceeds udmabuf1 capacity");
+
+            const uint8_t* sentinel = outMap_.bytes() + sentinelOffset;
+            if(ReadLe32(sentinel) != 0 || ReadLe32(sentinel + 4) != 0 ||
+               ReadLe32(sentinel + 8) != 0 || ReadLe32(sentinel + 12) != 0xFFFFFFFFu)
+                throw runtime_error("TOP EOF sentinel mismatch");
+
+            rawKeypoints.clear();
+            rawKeypoints.reserve(kpCount);
+
+            for(uint32_t i = 0; i < kpCount; ++i)
+            {
+                const uint8_t* record = outMap_.bytes() + static_cast<size_t>(i) * kRecordBytes;
+                const uint16_t x = ReadLe16(record);
+                const uint16_t y = ReadLe16(record + 2);
+                const uint16_t score = ReadLe16(record + 4);
+                const int32_t angleQ24 = static_cast<int32_t>(ReadLe32(record + 8));
+                const uint32_t marker = ReadLe32(record + 12);
+
+                if(marker != 0)
+                    throw runtime_error("nonzero marker in TOP keypoint record");
+
+                if(x < minBorderX || x >= maxBorderX || y < minBorderY || y >= maxBorderY)
+                    continue;
+
+                KeyPoint keypoint;
+                keypoint.pt.x = static_cast<float>(x - minBorderX);
+                keypoint.pt.y = static_cast<float>(y - minBorderY);
+                keypoint.response = static_cast<float>(score);
+                keypoint.angle = HardwareAngleToDegrees(angleQ24);
+                rawKeypoints.push_back(keypoint);
+            }
+        }
+
+    private:
+        Fd dmaFd_;
+        Fd topFd_;
+        Fd inFd_;
+        Fd outFd_;
+        uint64_t inPhys_;
+        uint64_t outPhys_;
+        size_t inSize_;
+        size_t outSize_;
+        Mapping dmaRegs_;
+        Mapping topRegs_;
+        Mapping inMap_;
+        Mapping outMap_;
+        mutex mutex_;
+    };
+
+    OrbHwAccelerator& GetOrbHwAccelerator()
+    {
+        static OrbHwAccelerator accelerator;
+        return accelerator;
+    }
+
+}  // namespace
+#endif
 
     static float IC_Angle(const Mat& image, Point2f pt,  const vector<int> & u_max)
     {
@@ -928,6 +1302,69 @@ namespace ORB_SLAM3
 	#endif
     }
 
+#ifdef USE_HW_ACCEL
+    void ORBextractor::ComputeKeyPointsHardware(vector<vector<KeyPoint> >& allKeypoints)
+    {
+        allKeypoints.resize(nlevels);
+
+        #ifdef REGISTER_TIMES_SUBSTAGE
+            double hw_us_accum = 0.0;
+            double octtree_us_accum = 0.0;
+        #endif
+
+        for(int level = 0; level < nlevels; ++level)
+        {
+            const int minBorderX = EDGE_THRESHOLD-3;
+            const int minBorderY = minBorderX;
+            const int maxBorderX = mvImagePyramid[level].cols-EDGE_THRESHOLD+3;
+            const int maxBorderY = mvImagePyramid[level].rows-EDGE_THRESHOLD+3;
+
+            vector<KeyPoint> vToDistributeKeys;
+            vToDistributeKeys.reserve(nfeatures*10);
+
+            #ifdef REGISTER_TIMES_SUBSTAGE
+            auto t_hw_start = std::chrono::high_resolution_clock::now();
+            #endif
+
+            GetOrbHwAccelerator().RunLevel(mvImagePyramid[level], vToDistributeKeys,
+                                           minBorderX, maxBorderX, minBorderY, maxBorderY);
+
+            #ifdef REGISTER_TIMES_SUBSTAGE
+            auto t_hw_end = std::chrono::high_resolution_clock::now();
+            #endif
+
+            vector<KeyPoint>& keypoints = allKeypoints[level];
+            keypoints.reserve(nfeatures);
+
+            keypoints = DistributeOctTree(vToDistributeKeys, minBorderX, maxBorderX,
+                                          minBorderY, maxBorderY, mnFeaturesPerLevel[level], level);
+
+            #ifdef REGISTER_TIMES_SUBSTAGE
+            auto t_octtree_end = std::chrono::high_resolution_clock::now();
+            hw_us_accum += std::chrono::duration<double, std::micro>(t_hw_end - t_hw_start).count();
+            octtree_us_accum += std::chrono::duration<double, std::micro>(t_octtree_end - t_hw_end).count();
+            #endif
+
+            const int scaledPatchSize = PATCH_SIZE*mvScaleFactor[level];
+
+            const int nkps = keypoints.size();
+            for(int i = 0; i < nkps; ++i)
+            {
+                keypoints[i].pt.x += minBorderX;
+                keypoints[i].pt.y += minBorderY;
+                keypoints[i].octave = level;
+                keypoints[i].size = scaledPatchSize;
+            }
+        }
+
+        #ifdef REGISTER_TIMES_SUBSTAGE
+        vdFAST_us.push_back(hw_us_accum);
+        vdOctTree_us.push_back(octtree_us_accum);
+        vdOrient_us.push_back(0.0);
+        #endif
+    }
+#endif
+
     void ORBextractor::ComputeKeyPointsOld(std::vector<std::vector<KeyPoint> > &allKeypoints)
     {
         allKeypoints.resize(nlevels);
@@ -1139,8 +1576,13 @@ namespace ORB_SLAM3
 		#endif
 
         vector < vector<KeyPoint> > allKeypoints;
+#ifdef USE_HW_ACCEL
+        ComputeKeyPointsHardware(allKeypoints);
+#endif
+#ifndef USE_HW_ACCEL
         ComputeKeyPointsOctTree(allKeypoints);
         //ComputeKeyPointsOld(allKeypoints);
+#endif
 
 
         #ifdef REGISTER_TIMES_SUBSTAGE
