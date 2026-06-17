@@ -253,6 +253,17 @@ namespace top {
             p[i] = value;
     }
 
+    void CopyImageToMappedBytes(uint8_t* dst, const Mat& image)
+    {
+        for(int row = 0; row < image.rows; ++row)
+        {
+            const uchar* src = image.ptr<uchar>(row);
+            volatile uint8_t* rowDst = dst + static_cast<size_t>(row) * image.cols;
+            for(int col = 0; col < image.cols; ++col)
+                rowDst[col] = src[col];
+        }
+    }
+
     float HardwareAngleToDegrees(int32_t angleQ24)
     {
         float degrees = static_cast<float>(angleQ24) * (360.0f / 8388608.0f);
@@ -327,9 +338,7 @@ namespace top {
             if(traceCount_ < 20)
                 cerr << "[USE_HW_ACCEL] reset done level=" << level << endl;
 
-            for(int row = 0; row < image.rows; ++row)
-                memcpy(inMap_.bytes() + static_cast<size_t>(row) * image.cols,
-                       image.ptr<uchar>(row), static_cast<size_t>(image.cols));
+            CopyImageToMappedBytes(inMap_.bytes(), image);
 
             if(traceCount_ < 20)
                 cerr << "[USE_HW_ACCEL] input copied level=" << level << endl;
