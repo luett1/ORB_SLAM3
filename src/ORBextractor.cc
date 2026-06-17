@@ -1743,7 +1743,11 @@ namespace top {
     void ORBextractor::WriteTimingsCSV(const std::string& filename)
     {
         std::ofstream f(filename);
+#ifdef USE_HW_ACCEL
+        f << "#Pyramid_us,HW_FAST_ORIENT_DMA_us,OctTree_us,Orient_us,Descriptors_us\n";
+#else
         f << "#Pyramid_us,FAST_us,OctTree_us,Orient_us,Descriptors_us\n";
+#endif
         const size_t N = vdFAST_us.size();
         for (size_t i = 0; i < N; ++i) {
             const double pyr  = (i < vdPyramid_us.size())     ? vdPyramid_us[i]     : 0.0;
