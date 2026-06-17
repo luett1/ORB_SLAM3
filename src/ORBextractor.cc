@@ -316,12 +316,6 @@ namespace top {
                      << ", inLen=" << inLen
                      << ", outLen=" << outLen << endl;
 
-            for(int row = 0; row < image.rows; ++row)
-                memcpy(inMap_.bytes() + static_cast<size_t>(row) * image.cols,
-                       image.ptr<uchar>(row), static_cast<size_t>(image.cols));
-
-            FillMappedBytes(outMap_.bytes(), outLen, 0xA5);
-
             topRegs_.write32(top::CTRL, top::CtrlSoftReset);
             this_thread::sleep_for(chrono::milliseconds(1));
             topRegs_.write32(top::CTRL, 0);
@@ -329,6 +323,16 @@ namespace top {
             dmaRegs_.write32(dma::MM2S_DMACR, dma::DmacrReset);
             dmaRegs_.write32(dma::S2MM_DMACR, dma::DmacrReset);
             this_thread::sleep_for(chrono::milliseconds(10));
+
+            if(traceCount_ < 20)
+                cerr << "[USE_HW_ACCEL] reset done level=" << level << endl;
+
+            for(int row = 0; row < image.rows; ++row)
+                memcpy(inMap_.bytes() + static_cast<size_t>(row) * image.cols,
+                       image.ptr<uchar>(row), static_cast<size_t>(image.cols));
+
+            if(traceCount_ < 20)
+                cerr << "[USE_HW_ACCEL] input copied level=" << level << endl;
 
             topRegs_.write32(top::WIDTH, static_cast<uint32_t>(image.cols));
             topRegs_.write32(top::HEIGHT, static_cast<uint32_t>(image.rows));
@@ -346,6 +350,9 @@ namespace top {
             dmaRegs_.write32(dma::MM2S_SA, static_cast<uint32_t>(inPhys_));
             dmaRegs_.write32(dma::MM2S_SA_MSB, 0);
             dmaRegs_.write32(dma::MM2S_LENGTH, static_cast<uint32_t>(inLen));
+
+            if(traceCount_ < 20)
+                cerr << "[USE_HW_ACCEL] transfer started level=" << level << endl;
 
             const chrono::steady_clock::time_point start = chrono::steady_clock::now();
             bool dmaError = false;
