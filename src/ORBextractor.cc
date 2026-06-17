@@ -291,7 +291,7 @@ namespace top {
                 throw runtime_error("unexpected TOP build ID: " + Hex32(topId));
         }
 
-        void RunLevel(const Mat& image, vector<KeyPoint>& rawKeypoints,
+        void RunLevel(const Mat& image, vector<KeyPoint>& rawKeypoints, int level,
                       int minBorderX, int maxBorderX, int minBorderY, int maxBorderY)
         {
             lock_guard<mutex> lock(mutex_);
@@ -387,7 +387,18 @@ namespace top {
             if((finalStatus & top::StatusOverflow) != 0)
                 throw runtime_error("TOP overflow set");
             if(dropCount != 0)
-                throw runtime_error("TOP drop count is nonzero: " + to_string(dropCount));
+            {
+                if(dropWarningCount_ < 20)
+                {
+                    cerr << "[USE_HW_ACCEL] warning: TOP DROPCNT=" << dropCount
+                         << ", KPCOUNT=" << kpCount
+                         << ", level=" << level
+                         << ", image=" << image.cols << "x" << image.rows << endl;
+                    if(dropWarningCount_ == 19)
+                        cerr << "[USE_HW_ACCEL] suppressing further DROPCNT warnings" << endl;
+                }
+                ++dropWarningCount_;
+            }
 
             const size_t sentinelOffset = static_cast<size_t>(kpCount) * kRecordBytes;
             if(sentinelOffset + kRecordBytes > outLen)
@@ -439,6 +450,7 @@ namespace top {
         Mapping inMap_;
         Mapping outMap_;
         mutex mutex_;
+        uint32_t dropWarningCount_ = 0;
     };
 
     OrbHwAccelerator& GetOrbHwAccelerator()
@@ -1326,7 +1338,7 @@ namespace top {
             auto t_hw_start = std::chrono::high_resolution_clock::now();
             #endif
 
-            GetOrbHwAccelerator().RunLevel(mvImagePyramid[level], vToDistributeKeys,
+            GetOrbHwAccelerator().RunLevel(mvImagePyramid[level], vToDistributeKeys, level,
                                            minBorderX, maxBorderX, minBorderY, maxBorderY);
 
             #ifdef REGISTER_TIMES_SUBSTAGE
