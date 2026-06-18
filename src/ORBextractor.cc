@@ -140,6 +140,7 @@ namespace top {
 
     const uint32_t CtrlEnable = 0x00000001;
     const uint32_t CtrlSoftReset = 0x00000002;
+    const uint32_t StatusBusy = 0x00000001;
     const uint32_t StatusDone = 0x00000002;
     const uint32_t StatusOverflow = 0x00000004;
     const uint32_t StatusCfgError = 0x00000008;
@@ -251,6 +252,57 @@ namespace top {
         return chrono::duration<double, std::micro>(end - start).count();
     }
 
+    void WaitForDmaRunStopAccepted(const Mapping& regs, uint32_t dmacrOffset,
+                                   const char* channelName)
+    {
+        const chrono::steady_clock::time_point start = chrono::steady_clock::now();
+        uint32_t dmacr = regs.read32(dmacrOffset);
+        while((dmacr & dma::DmacrRunStop) == 0)
+        {
+            const chrono::steady_clock::time_point now = chrono::steady_clock::now();
+            if(now - start > chrono::milliseconds(10))
+                throw runtime_error(string("AXI DMA run/stop not accepted: ") + channelName +
+                                    " DMACR=" + Hex32(dmacr));
+            this_thread::yield();
+            dmacr = regs.read32(dmacrOffset);
+        }
+    }
+
+    void PulseTopSoftReset(Mapping& regs)
+    {
+        const chrono::steady_clock::time_point start = chrono::steady_clock::now();
+
+        regs.write32(top::CTRL, top::CtrlSoftReset);
+        uint32_t ctrl = regs.read32(top::CTRL);
+        while((ctrl & top::CtrlSoftReset) == 0)
+        {
+            const chrono::steady_clock::time_point now = chrono::steady_clock::now();
+            if(now - start > chrono::milliseconds(10))
+                throw runtime_error("TOP soft reset assert timed out: CTRL=" + Hex32(ctrl));
+            this_thread::yield();
+            ctrl = regs.read32(top::CTRL);
+        }
+
+        regs.write32(top::CTRL, 0);
+        while(true)
+        {
+            ctrl = regs.read32(top::CTRL);
+            const uint32_t status = regs.read32(top::STATUS);
+            const bool resetCleared = (ctrl & top::CtrlSoftReset) == 0;
+            const bool statusCleared =
+                (status & (top::StatusBusy | top::StatusDone |
+                           top::StatusOverflow | top::StatusCfgError)) == 0;
+            if(resetCleared && statusCleared)
+                return;
+
+            const chrono::steady_clock::time_point now = chrono::steady_clock::now();
+            if(now - start > chrono::milliseconds(10))
+                throw runtime_error("TOP soft reset clear timed out: CTRL=" + Hex32(ctrl) +
+                                    " STATUS=" + Hex32(status));
+            this_thread::yield();
+        }
+    }
+
     uint16_t ReadLe16(const uint8_t* data)
     {
         return static_cast<uint16_t>(data[0]) |
@@ -348,9 +400,7 @@ namespace top {
                      << ", outLen=" << outLen << endl;
 #endif
 
-            topRegs_.write32(top::CTRL, top::CtrlSoftReset);
-            this_thread::sleep_for(chrono::milliseconds(1));
-            topRegs_.write32(top::CTRL, 0);
+            PulseTopSoftReset(topRegs_);
 
             dmaRegs_.write32(dma::MM2S_DMACR, dma::DmacrReset);
             dmaRegs_.write32(dma::S2MM_DMACR, dma::DmacrReset);
@@ -375,7 +425,8 @@ namespace top {
 
             dmaRegs_.write32(dma::S2MM_DMACR, dma::DmacrRunStop | dma::DmacrIocIrqEn);
             dmaRegs_.write32(dma::MM2S_DMACR, dma::DmacrRunStop | dma::DmacrIocIrqEn);
-            this_thread::sleep_for(chrono::milliseconds(1));
+            WaitForDmaRunStopAccepted(dmaRegs_, dma::S2MM_DMACR, "S2MM");
+            WaitForDmaRunStopAccepted(dmaRegs_, dma::MM2S_DMACR, "MM2S");
 
             dmaRegs_.write32(dma::S2MM_DA, static_cast<uint32_t>(outPhys_));
             dmaRegs_.write32(dma::S2MM_DA_MSB, 0);
@@ -423,7 +474,7 @@ namespace top {
                     break;
                 }
 
-                this_thread::sleep_for(chrono::milliseconds(1));
+                this_thread::sleep_for(chrono::microseconds(50));
             }
 
             const uint32_t finalStatus = topRegs_.read32(top::STATUS);
