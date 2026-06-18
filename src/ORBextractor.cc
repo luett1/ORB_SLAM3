@@ -232,6 +232,25 @@ namespace top {
         return stream.str();
     }
 
+    double WaitForDmaResetClear(const Mapping& regs, uint32_t dmacrOffset,
+                                const char* channelName)
+    {
+        const chrono::steady_clock::time_point start = chrono::steady_clock::now();
+        uint32_t dmacr = regs.read32(dmacrOffset);
+        while((dmacr & dma::DmacrReset) != 0)
+        {
+            const chrono::steady_clock::time_point now = chrono::steady_clock::now();
+            if(now - start > chrono::milliseconds(10))
+                throw runtime_error(string("AXI DMA reset timed out: ") + channelName +
+                                    " DMACR=" + Hex32(dmacr));
+            this_thread::yield();
+            dmacr = regs.read32(dmacrOffset);
+        }
+
+        const chrono::steady_clock::time_point end = chrono::steady_clock::now();
+        return chrono::duration<double, std::micro>(end - start).count();
+    }
+
     uint16_t ReadLe16(const uint8_t* data)
     {
         return static_cast<uint16_t>(data[0]) |
@@ -306,8 +325,8 @@ namespace top {
                 throw runtime_error("unexpected TOP build ID: " + Hex32(topId));
         }
 
-        void RunLevel(const Mat& image, vector<KeyPoint>& rawKeypoints, int level,
-                      int minBorderX, int maxBorderX, int minBorderY, int maxBorderY)
+        double RunLevel(const Mat& image, vector<KeyPoint>& rawKeypoints, int level,
+                        int minBorderX, int maxBorderX, int minBorderY, int maxBorderY)
         {
             lock_guard<mutex> lock(mutex_);
 
@@ -335,7 +354,9 @@ namespace top {
 
             dmaRegs_.write32(dma::MM2S_DMACR, dma::DmacrReset);
             dmaRegs_.write32(dma::S2MM_DMACR, dma::DmacrReset);
-            this_thread::sleep_for(chrono::milliseconds(10));
+            const double dmaResetUs =
+                WaitForDmaResetClear(dmaRegs_, dma::MM2S_DMACR, "MM2S") +
+                WaitForDmaResetClear(dmaRegs_, dma::S2MM_DMACR, "S2MM");
 
 #ifdef USE_HW_ACCEL_TRACE
             if(traceCount_ < 20)
@@ -481,6 +502,7 @@ namespace top {
                      << ", DROPCNT=" << dropCount << endl;
             ++traceCount_;
 #endif
+            return dmaResetUs;
         }
 
     private:
@@ -1373,6 +1395,7 @@ namespace top {
 
         #ifdef REGISTER_TIMES_SUBSTAGE
             double hw_us_accum = 0.0;
+            double hw_dma_reset_us_accum = 0.0;
             double octtree_us_accum = 0.0;
         #endif
 
@@ -1390,11 +1413,16 @@ namespace top {
             auto t_hw_start = std::chrono::high_resolution_clock::now();
             #endif
 
-            GetOrbHwAccelerator().RunLevel(mvImagePyramid[level], vToDistributeKeys, level,
-                                           minBorderX, maxBorderX, minBorderY, maxBorderY);
+            const double dma_reset_us =
+                GetOrbHwAccelerator().RunLevel(mvImagePyramid[level], vToDistributeKeys, level,
+                                               minBorderX, maxBorderX, minBorderY, maxBorderY);
+#ifndef REGISTER_TIMES_SUBSTAGE
+            (void)dma_reset_us;
+#endif
 
             #ifdef REGISTER_TIMES_SUBSTAGE
             auto t_hw_end = std::chrono::high_resolution_clock::now();
+            hw_dma_reset_us_accum += dma_reset_us;
             #endif
 
             vector<KeyPoint>& keypoints = allKeypoints[level];
@@ -1423,8 +1451,8 @@ namespace top {
 
         #ifdef REGISTER_TIMES_SUBSTAGE
         vdFAST_us.push_back(hw_us_accum);
+        vdHwDmaReset_us.push_back(hw_dma_reset_us_accum);
         vdOctTree_us.push_back(octtree_us_accum);
-        vdOrient_us.push_back(0.0);
         #endif
     }
 #endif
@@ -1760,7 +1788,7 @@ namespace top {
     {
         std::ofstream f(filename);
 #ifdef USE_HW_ACCEL
-        f << "#Pyramid_us,HW_FAST_ORIENT_DMA_us,OctTree_us,Orient_us,Descriptors_us\n";
+        f << "#Pyramid_us,HW_Total_us,HW_DmaReset_us,OctTree_us,Descriptors_us\n";
 #else
         f << "#Pyramid_us,FAST_us,OctTree_us,Orient_us,Descriptors_us\n";
 #endif
@@ -1769,9 +1797,14 @@ namespace top {
             const double pyr  = (i < vdPyramid_us.size())     ? vdPyramid_us[i]     : 0.0;
             const double fast = (i < vdFAST_us.size())        ? vdFAST_us[i]        : 0.0;
             const double oct  = (i < vdOctTree_us.size())     ? vdOctTree_us[i]     : 0.0;
-            const double ori  = (i < vdOrient_us.size())      ? vdOrient_us[i]      : 0.0;
             const double dsc  = (i < vdDescriptors_us.size()) ? vdDescriptors_us[i] : 0.0;
+#ifdef USE_HW_ACCEL
+            const double dmaReset = (i < vdHwDmaReset_us.size()) ? vdHwDmaReset_us[i] : 0.0;
+            f << pyr << "," << fast << "," << dmaReset << "," << oct << "," << dsc << "\n";
+#else
+            const double ori  = (i < vdOrient_us.size())      ? vdOrient_us[i]      : 0.0;
             f << pyr << "," << fast << "," << oct << "," << ori << "," << dsc << "\n";
+#endif
         }
         f.close();
     }

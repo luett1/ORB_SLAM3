@@ -67,6 +67,9 @@ public:
 	// Per-stage timing accumulators (microseconds, one entry per frame call)
 	std::vector<double> vdPyramid_us;
 	std::vector<double> vdFAST_us;
+#ifdef USE_HW_ACCEL
+	std::vector<double> vdHwDmaReset_us;
+#endif
 	std::vector<double> vdOctTree_us;
 	std::vector<double> vdOrient_us;
 	std::vector<double> vdDescriptors_us;
