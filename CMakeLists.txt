@@ -390,7 +390,7 @@ if(realsense2_FOUND)
 endif()
 
 # Timing instrumentation flags
-option(USE_HW_ACCEL "Enable KR260 AXI-DMA hardware acceleration in ORBextractor" OFF)
+option(USE_HW_ACCEL "Enable KR260 AXI-DMA hardware acceleration in ORBextractor" ON)
 option(USE_HW_ACCEL_TRACE "Enable verbose KR260 hardware accelerator trace logging" OFF)
 option(REGISTER_TIMES "Enable ORB-SLAM3 built-in per-stage timing (Tracking::PrintTimeStats)" ON)
 option(REGISTER_TIMES_SUBSTAGE "Enable per-stage timing inside ORBextractor (writes ORBExtractorTimings.txt)" ON)
