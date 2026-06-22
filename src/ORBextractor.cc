@@ -383,6 +383,105 @@ namespace top {
         return degrees;
     }
 
+    // One PL keypoint as delivered for a single pyramid level (raw, absolute coords).
+    struct PLKeypoint
+    {
+        float    x;             // level-image absolute coords (window center)
+        float    y;
+        uint16_t score;         // FAST response
+        int32_t  angleQ24;      // raw 24b sign-extended HW angle
+        bool     is_brighter;
+        bool     passed_strict; // score >= iniThFAST(20)
+    };
+
+    // PS-side per-cell strict/permissive filter == ORB-SLAM3's per-cell double-FAST.
+    // The PL detects at THRESHOLD_PERMISSIVE(7) over the whole image and tags every
+    // corner with passed_strict (score>=20). Per W=35 cell: if ANY corner is strict,
+    // keep only the strict ones (== FAST at iniThFAST); else keep all permissive
+    // (== the empty-cell minThFAST fallback). Validated bit-exact vs OpenCV FAST
+    // (TYPE_9_16) in select_per_cell.cpp. Without this the octree was fed the full
+    // permissive flood, producing weak, non-repeatable keypoints (see F.10).
+    // Output is in the (absolute - minBorder) frame DistributeOctTree expects, with
+    // the HW angle carried in kp.angle (so the HW path skips computeOrientation).
+    vector<KeyPoint> SelectPerCellHW(int cols, int rows, const vector<PLKeypoint>& plKps)
+    {
+        const int   EDGE        = EDGE_THRESHOLD;   // 19
+        const float W           = 35.0f;
+        const int   FAST_BORDER = 3;                // empirically confirmed for TYPE_9_16
+
+        // identical to ComputeKeyPointsOctTree
+        const int minBorderX = EDGE - 3;
+        const int minBorderY = minBorderX;
+        const int maxBorderX = cols - EDGE + 3;
+        const int maxBorderY = rows - EDGE + 3;
+
+        const float width  = static_cast<float>(maxBorderX - minBorderX);
+        const float height = static_cast<float>(maxBorderY - minBorderY);
+        const int nCols = static_cast<int>(width  / W);
+        const int nRows = static_cast<int>(height / W);
+        const int wCell = static_cast<int>(ceil(width  / nCols));
+        const int hCell = static_cast<int>(ceil(height / nRows));
+
+        vector<KeyPoint> vToDistributeKeys;
+        vToDistributeKeys.reserve(plKps.size());
+
+        // Each PL corner lands in at most one cell (regions are contiguous; the
+        // 'used' guard is defensive against the 6px cell overlap).
+        vector<char> used(plKps.size(), 0);
+
+        for(int i = 0; i < nRows; ++i)
+        {
+            const int iniY = minBorderY + i * hCell;
+            int maxY = iniY + hCell + 6;
+            if(iniY >= maxBorderY - 3) continue;
+            if(maxY > maxBorderY) maxY = maxBorderY;
+
+            for(int j = 0; j < nCols; ++j)
+            {
+                const int iniX = minBorderX + j * wCell;
+                int maxX = iniX + wCell + 6;
+                if(iniX >= maxBorderX - 6) continue;
+                if(maxX > maxBorderX) maxX = maxBorderX;
+
+                // Cell detection region in absolute level coords.
+                const float xLo = static_cast<float>(iniX + FAST_BORDER);
+                const float xHi = static_cast<float>(maxX - FAST_BORDER - 1);
+                const float yLo = static_cast<float>(iniY + FAST_BORDER);
+                const float yHi = static_cast<float>(maxY - FAST_BORDER - 1);
+
+                vector<size_t> cellIdx;
+                bool anyStrict = false;
+                for(size_t k = 0; k < plKps.size(); ++k)
+                {
+                    if(used[k]) continue;
+                    const PLKeypoint& p = plKps[k];
+                    if(p.x >= xLo && p.x <= xHi && p.y >= yLo && p.y <= yHi)
+                    {
+                        cellIdx.push_back(k);
+                        if(p.passed_strict) anyStrict = true;
+                    }
+                }
+                if(cellIdx.empty()) continue;
+
+                // if-any-strict-else-all  (== iniThFAST else minThFAST fallback)
+                for(size_t k : cellIdx)
+                {
+                    const PLKeypoint& p = plKps[k];
+                    if(anyStrict && !p.passed_strict) continue;
+                    used[k] = 1;
+
+                    KeyPoint kp;
+                    kp.pt.x     = p.x - minBorderX;
+                    kp.pt.y     = p.y - minBorderY;
+                    kp.angle    = HardwareAngleToDegrees(p.angleQ24);  // HW orientation
+                    kp.response = static_cast<float>(p.score);
+                    vToDistributeKeys.push_back(kp);
+                }
+            }
+        }
+        return vToDistributeKeys;
+    }
+
     class OrbHwAccelerator
     {
     public:
@@ -558,8 +657,16 @@ namespace top {
                ReadLe32(sentinel + 8) != 0 || ReadLe32(sentinel + 12) != 0xFFFFFFFFu)
                 throw runtime_error("TOP EOF sentinel mismatch");
 
-            rawKeypoints.clear();
-            rawKeypoints.reserve(kpCount);
+            // SelectPerCellHW recomputes the borders from cols/rows (same formula as
+            // ComputeKeyPointsOctTree), so the passed border args are now redundant.
+            (void)minBorderX; (void)maxBorderX; (void)minBorderY; (void)maxBorderY;
+
+            // Decode every PL keypoint in RAW absolute level coords -- NO shift, NO
+            // border filter (SelectPerCellHW bins by W=35 cell and applies the shift).
+            // Crucially, read the passed_strict flag (record byte 6, bit 1): the old
+            // path discarded it and fed the octree the full permissive flood (F.10).
+            vector<PLKeypoint> plKps;
+            plKps.reserve(kpCount);
 
             for(uint32_t i = 0; i < kpCount; ++i)
             {
@@ -567,22 +674,25 @@ namespace top {
                 const uint16_t x = ReadLe16(record);
                 const uint16_t y = ReadLe16(record + 2);
                 const uint16_t score = ReadLe16(record + 4);
+                const uint8_t flags = record[6];
                 const int32_t angleQ24 = static_cast<int32_t>(ReadLe32(record + 8));
                 const uint32_t marker = ReadLe32(record + 12);
 
                 if(marker != 0)
                     throw runtime_error("nonzero marker in TOP keypoint record");
 
-                if(x < minBorderX || x >= maxBorderX || y < minBorderY || y >= maxBorderY)
-                    continue;
-
-                KeyPoint keypoint;
-                keypoint.pt.x = static_cast<float>(x - minBorderX);
-                keypoint.pt.y = static_cast<float>(y - minBorderY);
-                keypoint.response = static_cast<float>(score);
-                keypoint.angle = HardwareAngleToDegrees(angleQ24);
-                rawKeypoints.push_back(keypoint);
+                PLKeypoint p;
+                p.x = static_cast<float>(x);
+                p.y = static_cast<float>(y);
+                p.score = score;
+                p.angleQ24 = angleQ24;
+                p.is_brighter = (flags & 0x01) != 0;   // word1[48]
+                p.passed_strict = (flags & 0x02) != 0;  // word1[49] == score>=THRESHOLD_STRICT
+                plKps.push_back(p);
             }
+
+            // Per-cell strict/permissive selection (== ORB-SLAM3 per-cell double-FAST).
+            rawKeypoints = SelectPerCellHW(image.cols, image.rows, plKps);
 
 #ifdef USE_HW_ACCEL_TRACE
             if(traceCount_ < 20)
