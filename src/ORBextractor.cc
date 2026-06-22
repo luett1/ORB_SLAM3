@@ -101,6 +101,7 @@ namespace {
     const char* kOutPhysPath = "/sys/class/u-dma-buf/udmabuf1/phys_addr";
     const char* kInSizePath = "/sys/class/u-dma-buf/udmabuf0/size";
     const char* kOutSizePath = "/sys/class/u-dma-buf/udmabuf1/size";
+    const char* kInSyncDir = "/sys/class/u-dma-buf/udmabuf0";
 
     const size_t kDmaMapSize = 0x10000;
     const size_t kTopMapSize = 0x1000;
@@ -149,7 +150,7 @@ namespace top {
     class Fd
     {
     public:
-        explicit Fd(const char* path) : fd_(::open(path, O_RDWR | O_SYNC))
+        explicit Fd(const char* path, int flags) : fd_(::open(path, flags))
         {
             if(fd_ < 0)
                 throw runtime_error(string("open failed for ") + path + ": " + strerror(errno));
@@ -213,6 +214,41 @@ namespace top {
     private:
         uint8_t* data_;
         size_t size_;
+    };
+
+    // u-dma-buf manual cache control via sysfs. The buffers are mapped CACHEABLE
+    // (opened without O_SYNC) and the DMA path is non-coherent, so the CPU must
+    // flush before the DMA reads (sync_for_device) and invalidate before reading
+    // what the DMA wrote (sync_for_cpu). Works because sync_mode=1, dma_coherent=0.
+    class UdmabufSync
+    {
+    public:
+        explicit UdmabufSync(const string& dir) : base_(dir + "/") {}
+
+        void forDevice(uint64_t size)   // flush CPU cache -> DDR, before MM2S
+        {
+            writeAttr("sync_offset", 0);
+            writeAttr("sync_size", size);
+            writeAttr("sync_direction", 1);   // DMA_TO_DEVICE
+            writeAttr("sync_for_device", 1);
+        }
+
+        void forCpu(uint64_t size)      // invalidate CPU cache, after S2MM completes
+        {
+            writeAttr("sync_offset", 0);
+            writeAttr("sync_size", size);
+            writeAttr("sync_direction", 2);   // DMA_FROM_DEVICE
+            writeAttr("sync_for_cpu", 1);
+        }
+
+    private:
+        void writeAttr(const char* attr, uint64_t value)
+        {
+            ofstream out(base_ + attr);
+            if(!out || !(out << value))
+                throw runtime_error("u-dma-buf sysfs write failed: " + base_ + attr);
+        }
+        string base_;
     };
 
     uint64_t ReadU64Auto(const string& path)
@@ -324,15 +360,17 @@ namespace top {
             p[i] = value;
     }
 
-    void CopyImageToMappedBytes(uint8_t* dst, const Mat& image)
+    void CopyImageToMapped(uint8_t* dst, const Mat& image)
     {
-        for(int row = 0; row < image.rows; ++row)
-        {
-            const uchar* src = image.ptr<uchar>(row);
-            volatile uint8_t* rowDst = dst + static_cast<size_t>(row) * image.cols;
-            for(int col = 0; col < image.cols; ++col)
-                rowDst[col] = src[col];
-        }
+        // Plain memcpy is now legal+fast: the buffer is mapped CACHEABLE (Normal
+        // memory), not the non-cacheable Device mapping that made memcpy SIGBUS.
+        // Coherency with the DMA is handled by the explicit forDevice() flush.
+        const size_t cols = static_cast<size_t>(image.cols);
+        if(image.isContinuous())
+            memcpy(dst, image.data, cols * static_cast<size_t>(image.rows));
+        else
+            for(int row = 0; row < image.rows; ++row)
+                memcpy(dst + static_cast<size_t>(row) * cols, image.ptr<uchar>(row), cols);
     }
 
     float HardwareAngleToDegrees(int32_t angleQ24)
@@ -349,10 +387,10 @@ namespace top {
     {
     public:
         OrbHwAccelerator()
-            : dmaFd_(kDmaDev),
-              topFd_(kTopDev),
-              inFd_(kInDev),
-              outFd_(kOutDev),
+            : dmaFd_(kDmaDev, O_RDWR | O_SYNC),    // MMIO regs: uncached
+              topFd_(kTopDev, O_RDWR | O_SYNC),    // MMIO regs: uncached
+              inFd_(kInDev, O_RDWR),               // input buffer: CACHEABLE (fast memcpy)
+              outFd_(kOutDev, O_RDWR | O_SYNC),    // output buffer: uncached (small reads, always correct)
               inPhys_(ReadU64Auto(kInPhysPath)),
               outPhys_(ReadU64Auto(kOutPhysPath)),
               inSize_(static_cast<size_t>(ReadU64Auto(kInSizePath))),
@@ -413,7 +451,8 @@ namespace top {
                 cerr << "[USE_HW_ACCEL] reset done level=" << level << endl;
 #endif
 
-            CopyImageToMappedBytes(inMap_.bytes(), image);
+            CopyImageToMapped(inMap_.bytes(), image);
+            inSync_.forDevice(inLen);   // flush CPU cache -> DDR before MM2S reads it
 
 #ifdef USE_HW_ACCEL_TRACE
             if(traceCount_ < 20)
@@ -571,6 +610,7 @@ namespace top {
         Mapping topRegs_;
         Mapping inMap_;
         Mapping outMap_;
+        UdmabufSync inSync_{kInSyncDir};
         mutex mutex_;
 #ifdef USE_HW_ACCEL_TRACE
         uint32_t dropWarningCount_ = 0;
