@@ -403,6 +403,12 @@ namespace top {
     // permissive flood, producing weak, non-repeatable keypoints (see F.10).
     // Output is in the (absolute - minBorder) frame DistributeOctTree expects, with
     // the HW angle carried in kp.angle (so the HW path skips computeOrientation).
+    //
+    // O(corners) implementation: a counting sort buckets each corner into its unique
+    // cell, then emits per cell. The previous O(corners x cells) scan with a per-cell
+    // std::vector added ~51 ms to HW_Total on the threshold-7 flood (E.18). This is
+    // behaviour-identical -- same kept set, same cell-row-major emission order (raster
+    // within a cell), so vToDistributeKeys matches ORB-SLAM3 exactly -- at O(corners+cells).
     vector<KeyPoint> SelectPerCellHW(int cols, int rows, const vector<PLKeypoint>& plKps)
     {
         const int   EDGE        = EDGE_THRESHOLD;   // 19
@@ -419,65 +425,77 @@ namespace top {
         const float height = static_cast<float>(maxBorderY - minBorderY);
         const int nCols = static_cast<int>(width  / W);
         const int nRows = static_cast<int>(height / W);
-        const int wCell = static_cast<int>(ceil(width  / nCols));
-        const int hCell = static_cast<int>(ceil(height / nRows));
 
         vector<KeyPoint> vToDistributeKeys;
         vToDistributeKeys.reserve(plKps.size());
+        if(nCols <= 0 || nRows <= 0)
+            return vToDistributeKeys;
 
-        // Each PL corner lands in at most one cell (regions are contiguous; the
-        // 'used' guard is defensive against the 6px cell overlap).
-        vector<char> used(plKps.size(), 0);
+        const int wCell  = static_cast<int>(ceil(width  / nCols));
+        const int hCell  = static_cast<int>(ceil(height / nRows));
+        const int nCells = nRows * nCols;
 
-        for(int i = 0; i < nRows; ++i)
+        // Map a corner to its unique cell, or -1 ("no cell"). Cell detection regions
+        // are contiguous & non-overlapping (FAST_BORDER trims the 6px sub-image
+        // overlap), so integer division gives the candidate cell; validating against
+        // the (edge-clamped / skipped) region makes this exactly equivalent to the
+        // original region scan.
+        auto cell_of = [&](int x, int y) -> int
         {
+            const int j = (x - minBorderX - FAST_BORDER) / wCell;
+            const int i = (y - minBorderY - FAST_BORDER) / hCell;
+            if(i < 0 || i >= nRows || j < 0 || j >= nCols) return -1;
             const int iniY = minBorderY + i * hCell;
-            int maxY = iniY + hCell + 6;
-            if(iniY >= maxBorderY - 3) continue;
-            if(maxY > maxBorderY) maxY = maxBorderY;
+            const int iniX = minBorderX + j * wCell;
+            if(iniY >= maxBorderY - 3) return -1;   // skipped row (too thin at the edge)
+            if(iniX >= maxBorderX - 6) return -1;   // skipped col
+            int maxY = iniY + hCell + 6; if(maxY > maxBorderY) maxY = maxBorderY;
+            int maxX = iniX + wCell + 6; if(maxX > maxBorderX) maxX = maxBorderX;
+            if(x < iniX + FAST_BORDER || x > maxX - FAST_BORDER - 1) return -1;
+            if(y < iniY + FAST_BORDER || y > maxY - FAST_BORDER - 1) return -1;
+            return i * nCols + j;
+        };
 
-            for(int j = 0; j < nCols; ++j)
+        // Pass 1: cell id per corner, per-cell "any strict", per-cell histogram.
+        vector<int>  cellId(plKps.size());
+        vector<char> anyStrict(nCells, 0);
+        vector<int>  start(nCells + 1, 0);
+        for(size_t k = 0; k < plKps.size(); ++k)
+        {
+            const int cid = cell_of(static_cast<int>(plKps[k].x),
+                                    static_cast<int>(plKps[k].y));
+            cellId[k] = cid;
+            if(cid >= 0)
             {
-                const int iniX = minBorderX + j * wCell;
-                int maxX = iniX + wCell + 6;
-                if(iniX >= maxBorderX - 6) continue;
-                if(maxX > maxBorderX) maxX = maxBorderX;
-
-                // Cell detection region in absolute level coords.
-                const float xLo = static_cast<float>(iniX + FAST_BORDER);
-                const float xHi = static_cast<float>(maxX - FAST_BORDER - 1);
-                const float yLo = static_cast<float>(iniY + FAST_BORDER);
-                const float yHi = static_cast<float>(maxY - FAST_BORDER - 1);
-
-                vector<size_t> cellIdx;
-                bool anyStrict = false;
-                for(size_t k = 0; k < plKps.size(); ++k)
-                {
-                    if(used[k]) continue;
-                    const PLKeypoint& p = plKps[k];
-                    if(p.x >= xLo && p.x <= xHi && p.y >= yLo && p.y <= yHi)
-                    {
-                        cellIdx.push_back(k);
-                        if(p.passed_strict) anyStrict = true;
-                    }
-                }
-                if(cellIdx.empty()) continue;
-
-                // if-any-strict-else-all  (== iniThFAST else minThFAST fallback)
-                for(size_t k : cellIdx)
-                {
-                    const PLKeypoint& p = plKps[k];
-                    if(anyStrict && !p.passed_strict) continue;
-                    used[k] = 1;
-
-                    KeyPoint kp;
-                    kp.pt.x     = p.x - minBorderX;
-                    kp.pt.y     = p.y - minBorderY;
-                    kp.angle    = HardwareAngleToDegrees(p.angleQ24);  // HW orientation
-                    kp.response = static_cast<float>(p.score);
-                    vToDistributeKeys.push_back(kp);
-                }
+                ++start[cid + 1];
+                if(plKps[k].passed_strict) anyStrict[cid] = 1;
             }
+        }
+
+        // Prefix sum -> per-cell start offsets; start[nCells] = #corners with a cell.
+        for(int c = 0; c < nCells; ++c) start[c + 1] += start[c];
+        const int total = start[nCells];
+
+        // Pass 2: stable counting sort of corner indices into cell-row-major order
+        // (raster order preserved within a cell) -- matches ORB-SLAM3's scan order.
+        vector<int> order(total);
+        vector<int> pos(start.begin(), start.begin() + nCells);
+        for(size_t k = 0; k < plKps.size(); ++k)
+            if(cellId[k] >= 0)
+                order[pos[cellId[k]]++] = static_cast<int>(k);
+
+        // Pass 3: emit per cell -- if any strict in the cell, keep only strict; else all.
+        for(int t = 0; t < total; ++t)
+        {
+            const PLKeypoint& p = plKps[order[t]];
+            if(anyStrict[cellId[order[t]]] && !p.passed_strict) continue;
+
+            KeyPoint kp;
+            kp.pt.x     = p.x - minBorderX;
+            kp.pt.y     = p.y - minBorderY;
+            kp.angle    = HardwareAngleToDegrees(p.angleQ24);  // HW orientation
+            kp.response = static_cast<float>(p.score);
+            vToDistributeKeys.push_back(kp);
         }
         return vToDistributeKeys;
     }
