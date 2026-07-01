@@ -69,6 +69,7 @@
 #ifdef USE_HW_ACCEL
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <mutex>
@@ -603,13 +604,29 @@ namespace top {
 
             // Strict-cell gate geometry (same grid SelectPerCellHW uses). CELLDIM =
             // hCell:wCell, CELLNUM = nRows:nCols, packed 16b each.
-            const CellGrid grid = ComputeCellGrid(image.cols, image.rows);
-            topRegs_.write32(top::CELLDIM,
-                             (static_cast<uint32_t>(grid.hCell) << 16) |
-                             static_cast<uint16_t>(grid.wCell));
-            topRegs_.write32(top::CELLNUM,
-                             (static_cast<uint32_t>(grid.nRows) << 16) |
-                             static_cast<uint16_t>(grid.nCols));
+            //
+            // A/B toggle: ORB_HW_GATE=0 runs the gate INERT (writes cfg=0 -> nCols=0
+            // -> the safe check can never assert -> zero suppression), so the SAME
+            // bitstream+binary can be run gate-off vs gate-on. Read once (static).
+            static const bool gateOn = []{
+                const char* e = getenv("ORB_HW_GATE");
+                return !(e != nullptr && e[0] == '0');   // ON unless ORB_HW_GATE=0
+            }();
+            if(gateOn)
+            {
+                const CellGrid grid = ComputeCellGrid(image.cols, image.rows);
+                topRegs_.write32(top::CELLDIM,
+                                 (static_cast<uint32_t>(grid.hCell) << 16) |
+                                 static_cast<uint16_t>(grid.wCell));
+                topRegs_.write32(top::CELLNUM,
+                                 (static_cast<uint32_t>(grid.nRows) << 16) |
+                                 static_cast<uint16_t>(grid.nCols));
+            }
+            else
+            {
+                topRegs_.write32(top::CELLDIM, 0);
+                topRegs_.write32(top::CELLNUM, 0);   // nCols=0 -> gate inert
+            }
 
             dmaRegs_.write32(dma::S2MM_DMACR, dma::DmacrRunStop | dma::DmacrIocIrqEn);
             dmaRegs_.write32(dma::MM2S_DMACR, dma::DmacrRunStop | dma::DmacrIocIrqEn);
