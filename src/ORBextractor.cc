@@ -138,6 +138,9 @@ namespace top {
     const uint32_t KPCOUNT = 0x14;
     const uint32_t DROPCNT = 0x18;
     const uint32_t ID = 0x1C;
+    const uint32_t CELLDIM = 0x20;   // [15:0]=wCell  [31:16]=hCell (strict-cell gate)
+    const uint32_t CELLNUM = 0x24;   // [15:0]=nCols  [31:16]=nRows (strict-cell gate)
+    const uint32_t SUPPCNT = 0x28;   // RO: gate-suppressed permissive-corner count
 
     const uint32_t CtrlEnable = 0x00000001;
     const uint32_t CtrlSoftReset = 0x00000002;
@@ -394,6 +397,27 @@ namespace top {
         bool     passed_strict; // score >= iniThFAST(20)
     };
 
+    // Selection-cell grid geometry. Single source of truth shared by the HW gate's
+    // config-register writes and SelectPerCellHW, so the PL strict-cell gate and the
+    // SW per-cell filter tile the image identically. Integer math is bit-identical to
+    // the original float form over the valid range (int / == floor for >=0;
+    // (a+b-1)/b == ceil(a/b) for positive ints).
+    struct CellGrid { int nCols, nRows, wCell, hCell; };
+
+    static inline CellGrid ComputeCellGrid(int cols, int rows)
+    {
+        const int W      = 35;                          // ORB-SLAM3 grid cell size
+        const int border = 2 * (EDGE_THRESHOLD - 3);    // 2*minBorderX
+        const int width  = cols - border;
+        const int height = rows - border;
+        CellGrid g;
+        g.nCols = width  / W;
+        g.nRows = height / W;
+        g.wCell = (g.nCols > 0) ? (width  + g.nCols - 1) / g.nCols : width;
+        g.hCell = (g.nRows > 0) ? (height + g.nRows - 1) / g.nRows : height;
+        return g;
+    }
+
     // PS-side per-cell strict/permissive filter == ORB-SLAM3's per-cell double-FAST.
     // The PL detects at THRESHOLD_PERMISSIVE(7) over the whole image and tags every
     // corner with passed_strict (score>=20). Per W=35 cell: if ANY corner is strict,
@@ -412,7 +436,6 @@ namespace top {
     vector<KeyPoint> SelectPerCellHW(int cols, int rows, const vector<PLKeypoint>& plKps)
     {
         const int   EDGE        = EDGE_THRESHOLD;   // 19
-        const float W           = 35.0f;
         const int   FAST_BORDER = 3;                // empirically confirmed for TYPE_9_16
 
         // identical to ComputeKeyPointsOctTree
@@ -421,18 +444,17 @@ namespace top {
         const int maxBorderX = cols - EDGE + 3;
         const int maxBorderY = rows - EDGE + 3;
 
-        const float width  = static_cast<float>(maxBorderX - minBorderX);
-        const float height = static_cast<float>(maxBorderY - minBorderY);
-        const int nCols = static_cast<int>(width  / W);
-        const int nRows = static_cast<int>(height / W);
+        // Grid geometry from the shared helper == the values written to the HW gate.
+        const CellGrid g = ComputeCellGrid(cols, rows);
+        const int nCols = g.nCols, nRows = g.nRows;
 
         vector<KeyPoint> vToDistributeKeys;
         vToDistributeKeys.reserve(plKps.size());
         if(nCols <= 0 || nRows <= 0)
             return vToDistributeKeys;
 
-        const int wCell  = static_cast<int>(ceil(width  / nCols));
-        const int hCell  = static_cast<int>(ceil(height / nRows));
+        const int wCell  = g.wCell;
+        const int hCell  = g.hCell;
         const int nCells = nRows * nCols;
 
         // Map a corner to its unique cell, or -1 ("no cell"). Cell detection regions
@@ -578,6 +600,16 @@ namespace top {
 
             topRegs_.write32(top::WIDTH, static_cast<uint32_t>(image.cols));
             topRegs_.write32(top::HEIGHT, static_cast<uint32_t>(image.rows));
+
+            // Strict-cell gate geometry (same grid SelectPerCellHW uses). CELLDIM =
+            // hCell:wCell, CELLNUM = nRows:nCols, packed 16b each.
+            const CellGrid grid = ComputeCellGrid(image.cols, image.rows);
+            topRegs_.write32(top::CELLDIM,
+                             (static_cast<uint32_t>(grid.hCell) << 16) |
+                             static_cast<uint16_t>(grid.wCell));
+            topRegs_.write32(top::CELLNUM,
+                             (static_cast<uint32_t>(grid.nRows) << 16) |
+                             static_cast<uint16_t>(grid.nCols));
 
             dmaRegs_.write32(dma::S2MM_DMACR, dma::DmacrRunStop | dma::DmacrIocIrqEn);
             dmaRegs_.write32(dma::MM2S_DMACR, dma::DmacrRunStop | dma::DmacrIocIrqEn);
