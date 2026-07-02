@@ -109,7 +109,9 @@ namespace {
     const size_t kHwInputMapBytes = 512 * 1024;
     const size_t kHwOutputMapBytes = 256 * 1024;
     const size_t kRecordBytes = 16;
-    const uint32_t kExpectedTopId = 0xC0DE0001u;
+    // 0xC0DE0002: corner-FIFO backpressure (zero-drop) + STALLCNT register.
+    // Older bitstreams (0xC0DE0001) lack STALLCNT and can tail-drop corners.
+    const uint32_t kExpectedTopId = 0xC0DE0002u;
 
 namespace dma {
     const uint32_t MM2S_DMACR = 0x00;
@@ -142,6 +144,8 @@ namespace top {
     const uint32_t CELLDIM = 0x20;   // [15:0]=wCell  [31:16]=hCell (strict-cell gate)
     const uint32_t CELLNUM = 0x24;   // [15:0]=nCols  [31:16]=nRows (strict-cell gate)
     const uint32_t SUPPCNT = 0x28;   // RO: gate-suppressed permissive-corner count
+    const uint32_t STALLCNT = 0x2C;  // RO: pixel beats stalled by corner-FIFO backpressure
+                                     //     this frame (PL cycles; the cost of zero drops)
 
     const uint32_t CtrlEnable = 0x00000001;
     const uint32_t CtrlSoftReset = 0x00000002;
@@ -555,8 +559,16 @@ namespace top {
                 throw runtime_error("unexpected TOP build ID: " + Hex32(topId));
         }
 
-        double RunLevel(const Mat& image, vector<KeyPoint>& rawKeypoints, int level,
-                        int minBorderX, int maxBorderX, int minBorderY, int maxBorderY)
+        // Per-level hardware stats returned by RunLevel (beyond the keypoints).
+        struct HwLevelStats
+        {
+            double dmaResetUs;      // time spent waiting on the two DMA channel resets
+            uint32_t stallCycles;   // STALLCNT: PL cycles the pixel stream was held off
+                                    // by corner-FIFO backpressure (0 unless corner-dense)
+        };
+
+        HwLevelStats RunLevel(const Mat& image, vector<KeyPoint>& rawKeypoints, int level,
+                              int minBorderX, int maxBorderX, int minBorderY, int maxBorderY)
         {
             lock_guard<mutex> lock(mutex_);
 
@@ -706,9 +718,10 @@ namespace top {
 
             const uint32_t finalStatus = topRegs_.read32(top::STATUS);
             const uint32_t kpCount = topRegs_.read32(top::KPCOUNT);
-#ifdef USE_HW_ACCEL_TRACE
+            // Both counters must be read BEFORE clearing CTRL: dropping enable sends
+            // the wrapper FSM to S_IDLE, which holds the core (and DROPCNT) in reset.
             const uint32_t dropCount = topRegs_.read32(top::DROPCNT);
-#endif
+            const uint32_t stallCycles = topRegs_.read32(top::STALLCNT);
 
             topRegs_.write32(top::CTRL, 0);
 
@@ -721,12 +734,16 @@ namespace top {
                 throw runtime_error("TOP cfg_error set");
             if((finalStatus & top::StatusOverflow) != 0)
                 throw runtime_error("TOP overflow set");
-#ifdef USE_HW_ACCEL_TRACE
+            // Build 0xC0DE0002 stalls the pixel stream before the corner FIFO can
+            // fill, so tail-drop is structurally impossible. A nonzero DROPCNT means
+            // the FIFO's PROG_FULL_GAP no longer covers the pipeline tail -- a real
+            // hardware regression, so this canary warns in every build (rate-limited).
             if(dropCount != 0)
             {
                 if(dropWarningCount_ < 20)
                 {
                     cerr << "[USE_HW_ACCEL] warning: TOP DROPCNT=" << dropCount
+                         << " (expected 0 with backpressure)"
                          << ", KPCOUNT=" << kpCount
                          << ", level=" << level
                          << ", image=" << image.cols << "x" << image.rows << endl;
@@ -735,7 +752,6 @@ namespace top {
                 }
                 ++dropWarningCount_;
             }
-#endif
 
             const size_t sentinelOffset = static_cast<size_t>(kpCount) * kRecordBytes;
             if(sentinelOffset + kRecordBytes > outLen)
@@ -788,10 +804,11 @@ namespace top {
                 cerr << "[USE_HW_ACCEL] done level=" << level
                      << ", KPCOUNT=" << kpCount
                      << ", kept=" << rawKeypoints.size()
-                     << ", DROPCNT=" << dropCount << endl;
+                     << ", DROPCNT=" << dropCount
+                     << ", STALLCNT=" << stallCycles << endl;
             ++traceCount_;
 #endif
-            return dmaResetUs;
+            return HwLevelStats{dmaResetUs, stallCycles};
         }
 
     private:
@@ -811,8 +828,8 @@ namespace top {
         Mapping outMap_;
         UdmabufSync inSync_{kInSyncDir};
         mutex mutex_;
-#ifdef USE_HW_ACCEL_TRACE
         uint32_t dropWarningCount_ = 0;
+#ifdef USE_HW_ACCEL_TRACE
         uint32_t traceCount_ = 0;
 #endif
     };
@@ -1686,6 +1703,7 @@ namespace top {
         #ifdef REGISTER_TIMES_SUBSTAGE
             double hw_us_accum = 0.0;
             double hw_dma_reset_us_accum = 0.0;
+            double hw_stall_cycles_accum = 0.0;
             double octtree_us_accum = 0.0;
         #endif
 
@@ -1703,16 +1721,17 @@ namespace top {
             auto t_hw_start = std::chrono::high_resolution_clock::now();
             #endif
 
-            const double dma_reset_us =
+            const auto hwStats =
                 GetOrbHwAccelerator().RunLevel(mvImagePyramid[level], vToDistributeKeys, level,
                                                minBorderX, maxBorderX, minBorderY, maxBorderY);
 #ifndef REGISTER_TIMES_SUBSTAGE
-            (void)dma_reset_us;
+            (void)hwStats;
 #endif
 
             #ifdef REGISTER_TIMES_SUBSTAGE
             auto t_hw_end = std::chrono::high_resolution_clock::now();
-            hw_dma_reset_us_accum += dma_reset_us;
+            hw_dma_reset_us_accum += hwStats.dmaResetUs;
+            hw_stall_cycles_accum += hwStats.stallCycles;
             #endif
 
             vector<KeyPoint>& keypoints = allKeypoints[level];
@@ -1742,6 +1761,7 @@ namespace top {
         #ifdef REGISTER_TIMES_SUBSTAGE
         vdFAST_us.push_back(hw_us_accum);
         vdHwDmaReset_us.push_back(hw_dma_reset_us_accum);
+        vdHwStall_cycles.push_back(hw_stall_cycles_accum);
         vdOctTree_us.push_back(octtree_us_accum);
         #endif
     }
@@ -2078,7 +2098,10 @@ namespace top {
     {
         std::ofstream f(filename);
 #ifdef USE_HW_ACCEL
-        f << "#Pyramid_us,HW_Total_us,HW_DmaReset_us,OctTree_us,Descriptors_us\n";
+        // HW_Stall_cycles: PL clock cycles the pixel stream was backpressured by the
+        // corner FIFO (STALLCNT, summed over levels) -- divide by the PL clock (e.g.
+        // 125 MHz) for the time cost of the zero-drop guarantee.
+        f << "#Pyramid_us,HW_Total_us,HW_DmaReset_us,HW_Stall_cycles,OctTree_us,Descriptors_us\n";
 #else
         f << "#Pyramid_us,FAST_us,OctTree_us,Orient_us,Descriptors_us\n";
 #endif
@@ -2090,7 +2113,8 @@ namespace top {
             const double dsc  = (i < vdDescriptors_us.size()) ? vdDescriptors_us[i] : 0.0;
 #ifdef USE_HW_ACCEL
             const double dmaReset = (i < vdHwDmaReset_us.size()) ? vdHwDmaReset_us[i] : 0.0;
-            f << pyr << "," << fast << "," << dmaReset << "," << oct << "," << dsc << "\n";
+            const double stall = (i < vdHwStall_cycles.size()) ? vdHwStall_cycles[i] : 0.0;
+            f << pyr << "," << fast << "," << dmaReset << "," << stall << "," << oct << "," << dsc << "\n";
 #else
             const double ori  = (i < vdOrient_us.size())      ? vdOrient_us[i]      : 0.0;
             f << pyr << "," << fast << "," << oct << "," << ori << "," << dsc << "\n";

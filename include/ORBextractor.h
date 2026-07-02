@@ -69,6 +69,9 @@ public:
 	std::vector<double> vdFAST_us;
 #ifdef USE_HW_ACCEL
 	std::vector<double> vdHwDmaReset_us;
+	// STALLCNT summed over levels, one entry per frame: PL cycles the pixel
+	// stream was held off by corner-FIFO backpressure (cost of zero drops).
+	std::vector<double> vdHwStall_cycles;
 #endif
 	std::vector<double> vdOctTree_us;
 	std::vector<double> vdOrient_us;
