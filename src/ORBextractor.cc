@@ -628,6 +628,28 @@ namespace top {
                 topRegs_.write32(top::CELLNUM, 0);   // nCols=0 -> gate inert
             }
 
+            // Debug: dump the FIRST level-0 image once (set ORB_HW_DUMP=1) so the RTL
+            // pyramid TB can be checked bit-exact against a REAL EuRoC frame, not just
+            // synthetic vectors. Off by default; harmless.
+            static const bool dumpOn = []{
+                const char* e = getenv("ORB_HW_DUMP");
+                return e != nullptr && e[0] == '1';
+            }();
+            static bool dumped = false;
+            if(dumpOn && !dumped && image.cols == 600)
+            {
+                ofstream df("hw_dump_L0.hex");
+                for(int r = 0; r < image.rows; ++r)
+                    for(int c = 0; c < image.cols; ++c)
+                    {
+                        const int v = static_cast<int>(image.at<uint8_t>(r, c));
+                        df << "0123456789abcdef"[v >> 4] << "0123456789abcdef"[v & 0xf] << '\n';
+                    }
+                dumped = true;
+                cerr << "[ORB_HW_DUMP] wrote hw_dump_L0.hex ("
+                     << image.cols << "x" << image.rows << ")" << endl;
+            }
+
             dmaRegs_.write32(dma::S2MM_DMACR, dma::DmacrRunStop | dma::DmacrIocIrqEn);
             dmaRegs_.write32(dma::MM2S_DMACR, dma::DmacrRunStop | dma::DmacrIocIrqEn);
             WaitForDmaRunStopAccepted(dmaRegs_, dma::S2MM_DMACR, "S2MM");
