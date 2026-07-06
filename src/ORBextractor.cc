@@ -109,9 +109,13 @@ namespace {
     const size_t kHwInputMapBytes = 512 * 1024;
     const size_t kHwOutputMapBytes = 256 * 1024;
     const size_t kRecordBytes = 16;
+    // 0xC0DE0003: keypoint packing v3 -- word1[63:32] = int32 response (FAST
+    //             score zero-extended or signed Harris response, selected at
+    //             synthesis by the G_SCORE_TYPE generic; readback THRESH[16]),
+    //             angle 24b + flags moved to word2. Older bitstreams pack a
+    //             16-bit score and flags in word1 and would be misparsed.
     // 0xC0DE0002: corner-FIFO backpressure (zero-drop) + STALLCNT register.
-    // Older bitstreams (0xC0DE0001) lack STALLCNT and can tail-drop corners.
-    const uint32_t kExpectedTopId = 0xC0DE0002u;
+    const uint32_t kExpectedTopId = 0xC0DE0003u;
 
 namespace dma {
     const uint32_t MM2S_DMACR = 0x00;
@@ -138,6 +142,7 @@ namespace top {
     const uint32_t STATUS = 0x04;
     const uint32_t WIDTH = 0x08;
     const uint32_t HEIGHT = 0x0C;
+    const uint32_t THRESH = 0x10;    // RO: [7:0]=perm [15:8]=strict [16]=score type
     const uint32_t KPCOUNT = 0x14;
     const uint32_t DROPCNT = 0x18;
     const uint32_t ID = 0x1C;
@@ -396,10 +401,11 @@ namespace top {
     {
         float    x;             // level-image absolute coords (window center)
         float    y;
-        uint16_t score;         // FAST response
+        int32_t  response;      // ranking response: FAST score (0..255) or signed
+                                // Harris response, per the bitstream's score type
         int32_t  angleQ24;      // raw 24b sign-extended HW angle
         bool     is_brighter;
-        bool     passed_strict; // score >= iniThFAST(20)
+        bool     passed_strict; // FAST score >= iniThFAST(20) -- in BOTH score modes
     };
 
     // Selection-cell grid geometry. Single source of truth shared by the HW gate's
@@ -521,7 +527,7 @@ namespace top {
             kp.pt.x     = p.x - minBorderX;
             kp.pt.y     = p.y - minBorderY;
             kp.angle    = HardwareAngleToDegrees(p.angleQ24);  // HW orientation
-            kp.response = static_cast<float>(p.score);
+            kp.response = static_cast<float>(p.response);
             vToDistributeKeys.push_back(kp);
         }
         return vToDistributeKeys;
@@ -557,6 +563,15 @@ namespace top {
             const uint32_t topId = topRegs_.read32(top::ID);
             if(topId != kExpectedTopId)
                 throw runtime_error("unexpected TOP build ID: " + Hex32(topId));
+
+            // Score type baked into the bitstream (THRESH[16], OpenCV enum:
+            // 0 = HARRIS_SCORE, 1 = FAST_SCORE). The record layout is identical
+            // either way (int32 response); log it once so runs are attributable.
+            const uint32_t thresh = topRegs_.read32(top::THRESH);
+            const bool harris = ((thresh >> 16) & 0x1u) == 0;
+            cerr << "[USE_HW_ACCEL] bitstream score type: "
+                 << (harris ? "HARRIS_SCORE" : "FAST_SCORE")
+                 << " (THRESH=" << Hex32(thresh) << ")" << endl;
         }
 
         // Per-level hardware stats returned by RunLevel (beyond the keypoints).
@@ -768,8 +783,9 @@ namespace top {
 
             // Decode every PL keypoint in RAW absolute level coords -- NO shift, NO
             // border filter (SelectPerCellHW bins by W=35 cell and applies the shift).
-            // Crucially, read the passed_strict flag (record byte 6, bit 1): the old
-            // path discarded it and fed the octree the full permissive flood (F.10).
+            // Packing v3 (build 0xC0DE0003): word1 = full int32 response, word2 =
+            // 24-bit angle + flags at bits 24/25. passed_strict is FAST-threshold-
+            // based in BOTH score modes; feeding it to the octree unfiltered was F.10.
             vector<PLKeypoint> plKps;
             plKps.reserve(kpCount);
 
@@ -778,10 +794,14 @@ namespace top {
                 const uint8_t* record = outMap_.bytes() + static_cast<size_t>(i) * kRecordBytes;
                 const uint16_t x = ReadLe16(record);
                 const uint16_t y = ReadLe16(record + 2);
-                const uint16_t score = ReadLe16(record + 4);
-                const uint8_t flags = record[6];
-                const int32_t angleQ24 = static_cast<int32_t>(ReadLe32(record + 8));
+                const int32_t response = static_cast<int32_t>(ReadLe32(record + 4));
+                const uint32_t word2 = ReadLe32(record + 8);
                 const uint32_t marker = ReadLe32(record + 12);
+
+                // word2[23:0] = angle, two's complement: sign-extend 24 -> 32.
+                const int32_t angleQ24 = (word2 & 0x00800000u)
+                                             ? static_cast<int32_t>(word2 | 0xFF000000u)
+                                             : static_cast<int32_t>(word2 & 0x00FFFFFFu);
 
                 if(marker != 0)
                     throw runtime_error("nonzero marker in TOP keypoint record");
@@ -789,10 +809,10 @@ namespace top {
                 PLKeypoint p;
                 p.x = static_cast<float>(x);
                 p.y = static_cast<float>(y);
-                p.score = score;
+                p.response = response;
                 p.angleQ24 = angleQ24;
-                p.is_brighter = (flags & 0x01) != 0;   // word1[48]
-                p.passed_strict = (flags & 0x02) != 0;  // word1[49] == score>=THRESHOLD_STRICT
+                p.is_brighter = (word2 & 0x01000000u) != 0;   // word2[88]
+                p.passed_strict = (word2 & 0x02000000u) != 0; // word2[89] == FAST score>=strict
                 plKps.push_back(p);
             }
 
