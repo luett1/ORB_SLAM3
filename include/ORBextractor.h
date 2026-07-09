@@ -50,8 +50,11 @@ public:
     
     enum {HARRIS_SCORE=0, FAST_SCORE=1 };
 
+    // hwAccelIndex selects the hardware accelerator instance to drive (F.12):
+    // 0 = left/mono/RGBD, 1 = right. Ignored when built without USE_HW_ACCEL, and
+    // folded back to 0 in a single-instance build (see ORB_HW_NUM_ACCELERATORS).
     ORBextractor(int nfeatures, float scaleFactor, int nlevels,
-                 int iniThFAST, int minThFAST);
+                 int iniThFAST, int minThFAST, int hwAccelIndex = 0);
 
     ~ORBextractor(){}
 
@@ -122,6 +125,7 @@ protected:
     int nlevels;
     int iniThFAST;
     int minThFAST;
+    int mHwAccelIndex;   // HW accelerator instance: 0 = left/mono/RGBD, 1 = right (F.12)
 
     std::vector<int> mnFeaturesPerLevel;
 

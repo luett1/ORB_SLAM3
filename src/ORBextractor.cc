@@ -72,6 +72,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
+#include <memory>
 #include <mutex>
 #include <sstream>
 #include <stdexcept>
@@ -94,15 +95,60 @@ namespace ORB_SLAM3
 #ifdef USE_HW_ACCEL
 namespace {
 
-    const char* kDmaDev = "/dev/uio4";
-    const char* kTopDev = "/dev/uio5";
-    const char* kInDev = "/dev/udmabuf0";
-    const char* kOutDev = "/dev/udmabuf1";
-    const char* kInPhysPath = "/sys/class/u-dma-buf/udmabuf0/phys_addr";
-    const char* kOutPhysPath = "/sys/class/u-dma-buf/udmabuf1/phys_addr";
-    const char* kInSizePath = "/sys/class/u-dma-buf/udmabuf0/size";
-    const char* kOutSizePath = "/sys/class/u-dma-buf/udmabuf1/size";
-    const char* kInSyncDir = "/sys/class/u-dma-buf/udmabuf0";
+    // ---- Hardware accelerator instance table --------------------------------
+    // Number of physical accelerator instances present in the loaded bitstream.
+    //   2 -> dual-accelerator build (F.12): the left/right extractors drive
+    //        separate cores on separate DMAs/HP ports and run truly in parallel.
+    //   1 -> single-instance build: both stereo extractors collapse onto
+    //        instance 0 (see GetOrbHwAccelerator) and serialize on its RunLevel
+    //        mutex, exactly reproducing the pre-F.12 behaviour.
+    // Switch builds by editing this default or with -DORB_HW_NUM_ACCELERATORS=1;
+    // no other code change is needed (mono/RGBD always use instance 0, and the
+    // right extractor's index is folded back to 0 by the modulo in the accessor).
+#ifndef ORB_HW_NUM_ACCELERATORS
+#define ORB_HW_NUM_ACCELERATORS 2
+#endif
+
+    // Per-instance device set. Instance 1's uio indices follow device-tree probe
+    // order and can renumber when the overlay changes -- verify against
+    // /sys/class/uio/*/name after loading the dual overlay before trusting them.
+    struct HwDeviceSet
+    {
+        const char* dmaDev;         // AXI DMA control regs (uio)
+        const char* topDev;         // TOP register file (uio)
+        const char* inDev;          // input u-dma-buf (pixels, cacheable)
+        const char* outDev;         // output u-dma-buf (keypoints, uncached)
+        const char* inPhysPath;     // sysfs: input phys addr
+        const char* outPhysPath;    // sysfs: output phys addr
+        const char* inSizePath;     // sysfs: input size
+        const char* outSizePath;    // sysfs: output size
+        const char* inSyncDir;      // sysfs dir for the input cache-sync controls
+    };
+
+    const HwDeviceSet kHwDeviceSets[] = {
+        {   // instance 0 -- left / mono / RGBD (DMA on HPC0, udmabuf0/1)
+            "/dev/uio4", "/dev/uio5", "/dev/udmabuf0", "/dev/udmabuf1",
+            "/sys/class/u-dma-buf/udmabuf0/phys_addr",
+            "/sys/class/u-dma-buf/udmabuf1/phys_addr",
+            "/sys/class/u-dma-buf/udmabuf0/size",
+            "/sys/class/u-dma-buf/udmabuf1/size",
+            "/sys/class/u-dma-buf/udmabuf0",
+        },
+        {   // instance 1 -- right (second DMA on HPC1, udmabuf2/3)
+            "/dev/uio6", "/dev/uio7", "/dev/udmabuf2", "/dev/udmabuf3",
+            "/sys/class/u-dma-buf/udmabuf2/phys_addr",
+            "/sys/class/u-dma-buf/udmabuf3/phys_addr",
+            "/sys/class/u-dma-buf/udmabuf2/size",
+            "/sys/class/u-dma-buf/udmabuf3/size",
+            "/sys/class/u-dma-buf/udmabuf2",
+        },
+    };
+
+    constexpr int kMaxHwAccelerators =
+        static_cast<int>(sizeof(kHwDeviceSets) / sizeof(kHwDeviceSets[0]));
+    constexpr int kNumHwAccelerators = ORB_HW_NUM_ACCELERATORS;
+    static_assert(kNumHwAccelerators >= 1 && kNumHwAccelerators <= kMaxHwAccelerators,
+                  "ORB_HW_NUM_ACCELERATORS must be between 1 and the device-set table size");
 
     const size_t kDmaMapSize = 0x10000;
     const size_t kTopMapSize = 0x1000;
@@ -536,17 +582,19 @@ namespace top {
     class OrbHwAccelerator
     {
     public:
-        OrbHwAccelerator()
-            : dmaFd_(kDmaDev, O_RDWR | O_SYNC),    // MMIO regs: uncached
-              topFd_(kTopDev, O_RDWR | O_SYNC),    // MMIO regs: uncached
-              inFd_(kInDev, O_RDWR),               // input buffer: CACHEABLE (fast memcpy)
-              outFd_(kOutDev, O_RDWR | O_SYNC),    // output buffer: uncached (small reads, always correct)
-              inPhys_(ReadU64Auto(kInPhysPath)),
-              outPhys_(ReadU64Auto(kOutPhysPath)),
-              inSize_(static_cast<size_t>(ReadU64Auto(kInSizePath))),
-              outSize_(static_cast<size_t>(ReadU64Auto(kOutSizePath))),
+        OrbHwAccelerator(const HwDeviceSet& dev, int instanceIndex)
+            : index_(instanceIndex),
+              dmaFd_(dev.dmaDev, O_RDWR | O_SYNC),    // MMIO regs: uncached
+              topFd_(dev.topDev, O_RDWR | O_SYNC),    // MMIO regs: uncached
+              inFd_(dev.inDev, O_RDWR),               // input buffer: CACHEABLE (fast memcpy)
+              outFd_(dev.outDev, O_RDWR | O_SYNC),    // output buffer: uncached (small reads, always correct)
+              inPhys_(ReadU64Auto(dev.inPhysPath)),
+              outPhys_(ReadU64Auto(dev.outPhysPath)),
+              inSize_(static_cast<size_t>(ReadU64Auto(dev.inSizePath))),
+              outSize_(static_cast<size_t>(ReadU64Auto(dev.outSizePath))),
               inMapSize_(min(inSize_, kHwInputMapBytes)),
-              outMapSize_(min(outSize_, kHwOutputMapBytes))
+              outMapSize_(min(outSize_, kHwOutputMapBytes)),
+              inSync_(dev.inSyncDir)
         {
             if(inMapSize_ == 0 || outMapSize_ < kRecordBytes)
                 throw runtime_error("invalid u-dma-buf size");
@@ -569,7 +617,8 @@ namespace top {
             // either way (int32 response); log it once so runs are attributable.
             const uint32_t thresh = topRegs_.read32(top::THRESH);
             const bool harris = ((thresh >> 16) & 0x1u) == 0;
-            cerr << "[USE_HW_ACCEL] bitstream score type: "
+            cerr << "[USE_HW_ACCEL] instance " << index_
+                 << " (" << dev.dmaDev << ", " << dev.topDev << "): score type "
                  << (harris ? "HARRIS_SCORE" : "FAST_SCORE")
                  << " (THRESH=" << Hex32(thresh) << ")" << endl;
         }
@@ -757,7 +806,8 @@ namespace top {
             {
                 if(dropWarningCount_ < 20)
                 {
-                    cerr << "[USE_HW_ACCEL] warning: TOP DROPCNT=" << dropCount
+                    cerr << "[USE_HW_ACCEL] warning: instance " << index_
+                         << " TOP DROPCNT=" << dropCount
                          << " (expected 0 with backpressure)"
                          << ", KPCOUNT=" << kpCount
                          << ", level=" << level
@@ -821,7 +871,8 @@ namespace top {
 
 #ifdef USE_HW_ACCEL_TRACE
             if(traceCount_ < 20)
-                cerr << "[USE_HW_ACCEL] done level=" << level
+                cerr << "[USE_HW_ACCEL] done instance=" << index_
+                     << ", level=" << level
                      << ", KPCOUNT=" << kpCount
                      << ", kept=" << rawKeypoints.size()
                      << ", DROPCNT=" << dropCount
@@ -832,6 +883,7 @@ namespace top {
         }
 
     private:
+        int index_;                 // which accelerator instance this object drives
         Fd dmaFd_;
         Fd topFd_;
         Fd inFd_;
@@ -846,7 +898,7 @@ namespace top {
         Mapping topRegs_;
         Mapping inMap_;
         Mapping outMap_;
-        UdmabufSync inSync_{kInSyncDir};
+        UdmabufSync inSync_;
         mutex mutex_;
         uint32_t dropWarningCount_ = 0;
 #ifdef USE_HW_ACCEL_TRACE
@@ -854,10 +906,24 @@ namespace top {
 #endif
     };
 
-    OrbHwAccelerator& GetOrbHwAccelerator()
+    // Returns the accelerator instance for the given extractor index. In a
+    // single-instance build (kNumHwAccelerators == 1) every request collapses to
+    // instance 0, so the left/right extractors share one core and serialize on
+    // its RunLevel mutex (the pre-F.12 path). Each instance is built lazily and
+    // exactly once: mono/RGBD never open instance 1's devices, and the parallel
+    // left/right threads can construct their own instances concurrently.
+    OrbHwAccelerator& GetOrbHwAccelerator(int requestedIndex)
     {
-        static OrbHwAccelerator accelerator;
-        return accelerator;
+        const int index = requestedIndex % kNumHwAccelerators;
+
+        static std::unique_ptr<OrbHwAccelerator> instances[kMaxHwAccelerators];
+        static std::once_flag initFlags[kMaxHwAccelerators];
+
+        std::call_once(initFlags[index], [index]{
+            instances[index].reset(
+                new OrbHwAccelerator(kHwDeviceSets[index], index));
+        });
+        return *instances[index];
     }
 
 }  // namespace
@@ -1197,9 +1263,9 @@ namespace top {
             };
 
     ORBextractor::ORBextractor(int _nfeatures, float _scaleFactor, int _nlevels,
-                               int _iniThFAST, int _minThFAST):
+                               int _iniThFAST, int _minThFAST, int _hwAccelIndex):
             nfeatures(_nfeatures), scaleFactor(_scaleFactor), nlevels(_nlevels),
-            iniThFAST(_iniThFAST), minThFAST(_minThFAST)
+            iniThFAST(_iniThFAST), minThFAST(_minThFAST), mHwAccelIndex(_hwAccelIndex)
     {
         mvScaleFactor.resize(nlevels);
         mvLevelSigma2.resize(nlevels);
@@ -1742,8 +1808,8 @@ namespace top {
             #endif
 
             const auto hwStats =
-                GetOrbHwAccelerator().RunLevel(mvImagePyramid[level], vToDistributeKeys, level,
-                                               minBorderX, maxBorderX, minBorderY, maxBorderY);
+                GetOrbHwAccelerator(mHwAccelIndex).RunLevel(mvImagePyramid[level], vToDistributeKeys, level,
+                                                            minBorderX, maxBorderX, minBorderY, maxBorderY);
 #ifndef REGISTER_TIMES_SUBSTAGE
             (void)hwStats;
 #endif
