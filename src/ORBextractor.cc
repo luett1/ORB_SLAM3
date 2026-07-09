@@ -112,6 +112,10 @@ namespace {
     // Per-instance device set. Instance 1's uio indices follow device-tree probe
     // order and can renumber when the overlay changes -- verify against
     // /sys/class/uio/*/name after loading the dual overlay before trusting them.
+    // With the append-only dual overlay (instance 0 nodes kept, instance 1 nodes
+    // appended after inst 0's two IRQ uio nodes), instance 1's register files land
+    // at /dev/uio8 (DMA) and /dev/uio9 (TOP). u-dma-buf is loaded with
+    // udmabuf2/udmabuf3 for instance 1 (modprobe params, not the overlay).
     struct HwDeviceSet
     {
         const char* dmaDev;         // AXI DMA control regs (uio)
@@ -135,7 +139,7 @@ namespace {
             "/sys/class/u-dma-buf/udmabuf0",
         },
         {   // instance 1 -- right (second DMA on HPC1, udmabuf2/3)
-            "/dev/uio6", "/dev/uio7", "/dev/udmabuf2", "/dev/udmabuf3",
+            "/dev/uio8", "/dev/uio9", "/dev/udmabuf2", "/dev/udmabuf3",
             "/sys/class/u-dma-buf/udmabuf2/phys_addr",
             "/sys/class/u-dma-buf/udmabuf3/phys_addr",
             "/sys/class/u-dma-buf/udmabuf2/size",
