@@ -67,6 +67,7 @@
 #include <fstream>
 
 #ifdef USE_HW_ACCEL
+#include <atomic>
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -96,18 +97,17 @@ namespace ORB_SLAM3
 namespace {
 
     // ---- Hardware accelerator instance table --------------------------------
-    // Number of physical accelerator instances present in the loaded bitstream.
+    // ORB_HW_NUM_ACCELERATORS (defaulted in ORBextractor.h so Frame.cc sees the
+    // same value) = number of physical accelerator instances in the bitstream.
     //   2 -> dual-accelerator build (F.12): the left/right extractors drive
-    //        separate cores on separate DMAs/HP ports and run truly in parallel.
-    //   1 -> single-instance build: both stereo extractors collapse onto
-    //        instance 0 (see GetOrbHwAccelerator) and serialize on its RunLevel
-    //        mutex, exactly reproducing the pre-F.12 behaviour.
-    // Switch builds by editing this default or with -DORB_HW_NUM_ACCELERATORS=1;
+    //        separate cores on separate DMAs/HP ports, and Frame.cc runs the
+    //        stereo ExtractORB calls in parallel threads.
+    //   1 -> single-instance build: Frame.cc serializes left/right, both stereo
+    //        extractors collapse onto instance 0 (see GetOrbHwAccelerator) and
+    //        share its RunLevel mutex, exactly reproducing the pre-F.12 path.
+    // Switch builds via the header default or -DORB_HW_NUM_ACCELERATORS=1;
     // no other code change is needed (mono/RGBD always use instance 0, and the
     // right extractor's index is folded back to 0 by the modulo in the accessor).
-#ifndef ORB_HW_NUM_ACCELERATORS
-#define ORB_HW_NUM_ACCELERATORS 2
-#endif
 
     // Per-instance device set. Instance 1's uio indices follow device-tree probe
     // order and can renumber when the overlay changes -- verify against
@@ -583,6 +583,16 @@ namespace top {
         return vToDistributeKeys;
     }
 
+    // Emit one console line as a SINGLE stream insertion. cerr is unit-buffered,
+    // so the whole line reaches the log in one write. Since F.12 the two
+    // accelerator instances log from concurrent left/right threads, and the run
+    // scripts grep these lines -- a chained << would let fragments from both
+    // instances interleave mid-line.
+    void LogLine(const string& line)
+    {
+        cerr << line + '\n';
+    }
+
     class OrbHwAccelerator
     {
     public:
@@ -621,10 +631,12 @@ namespace top {
             // either way (int32 response); log it once so runs are attributable.
             const uint32_t thresh = topRegs_.read32(top::THRESH);
             const bool harris = ((thresh >> 16) & 0x1u) == 0;
-            cerr << "[USE_HW_ACCEL] instance " << index_
-                 << " (" << dev.dmaDev << ", " << dev.topDev << "): score type "
-                 << (harris ? "HARRIS_SCORE" : "FAST_SCORE")
-                 << " (THRESH=" << Hex32(thresh) << ")" << endl;
+            ostringstream probe;
+            probe << "[USE_HW_ACCEL] instance " << index_
+                  << " (" << dev.dmaDev << ", " << dev.topDev << "): score type "
+                  << (harris ? "HARRIS_SCORE" : "FAST_SCORE")
+                  << " (THRESH=" << Hex32(thresh) << ")";
+            LogLine(probe.str());
         }
 
         // Per-level hardware stats returned by RunLevel (beyond the keypoints).
@@ -715,8 +727,10 @@ namespace top {
                 const char* e = getenv("ORB_HW_DUMP");
                 return e != nullptr && e[0] == '1';
             }();
-            static bool dumped = false;
-            if(dumpOn && !dumped && image.cols == 600)
+            // atomic exchange: with parallel L/R threads (F.12) both instances can
+            // reach the dump width in the same frame -- exactly one may write.
+            static atomic<bool> dumped{false};
+            if(dumpOn && image.cols == 600 && !dumped.exchange(true))
             {
                 ofstream df("hw_dump_L0.hex");
                 for(int r = 0; r < image.rows; ++r)
@@ -725,9 +739,10 @@ namespace top {
                         const int v = static_cast<int>(image.at<uint8_t>(r, c));
                         df << "0123456789abcdef"[v >> 4] << "0123456789abcdef"[v & 0xf] << '\n';
                     }
-                dumped = true;
-                cerr << "[ORB_HW_DUMP] wrote hw_dump_L0.hex ("
-                     << image.cols << "x" << image.rows << ")" << endl;
+                ostringstream msg;
+                msg << "[ORB_HW_DUMP] wrote hw_dump_L0.hex ("
+                    << image.cols << "x" << image.rows << ")";
+                LogLine(msg.str());
             }
 
             dmaRegs_.write32(dma::S2MM_DMACR, dma::DmacrRunStop | dma::DmacrIocIrqEn);
@@ -810,14 +825,16 @@ namespace top {
             {
                 if(dropWarningCount_ < 20)
                 {
-                    cerr << "[USE_HW_ACCEL] warning: instance " << index_
+                    ostringstream warn;
+                    warn << "[USE_HW_ACCEL] warning: instance " << index_
                          << " TOP DROPCNT=" << dropCount
                          << " (expected 0 with backpressure)"
                          << ", KPCOUNT=" << kpCount
                          << ", level=" << level
-                         << ", image=" << image.cols << "x" << image.rows << endl;
+                         << ", image=" << image.cols << "x" << image.rows;
+                    LogLine(warn.str());
                     if(dropWarningCount_ == 19)
-                        cerr << "[USE_HW_ACCEL] suppressing further DROPCNT warnings" << endl;
+                        LogLine("[USE_HW_ACCEL] suppressing further DROPCNT warnings");
                 }
                 ++dropWarningCount_;
             }

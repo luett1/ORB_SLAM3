@@ -119,7 +119,9 @@ Frame::Frame(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timeSt
 #ifdef REGISTER_TIMES
     std::chrono::steady_clock::time_point time_StartExtORB = std::chrono::steady_clock::now();
 #endif
-#ifdef USE_HW_ACCEL
+#if defined(USE_HW_ACCEL) && ORB_HW_NUM_ACCELERATORS < 2
+    // Single accelerator instance: both extractors would only serialize on its
+    // RunLevel mutex, so keep the calls sequential (pre-F.12 behaviour).
     ExtractORB(0, imLeft, 0, 0);
     ExtractORB(1, imRight, 0, 0);
 #else
@@ -1061,7 +1063,8 @@ Frame::Frame(const cv::Mat &imLeft, const cv::Mat &imRight, const double &timeSt
 #ifdef REGISTER_TIMES
     std::chrono::steady_clock::time_point time_StartExtORB = std::chrono::steady_clock::now();
 #endif
-#ifdef USE_HW_ACCEL
+#if defined(USE_HW_ACCEL) && ORB_HW_NUM_ACCELERATORS < 2
+    // Single accelerator instance: keep sequential (see the rectified-stereo ctor).
     ExtractORB(0, imLeft, static_cast<KannalaBrandt8*>(mpCamera)->mvLappingArea[0], static_cast<KannalaBrandt8*>(mpCamera)->mvLappingArea[1]);
     ExtractORB(1, imRight, static_cast<KannalaBrandt8*>(mpCamera2)->mvLappingArea[0], static_cast<KannalaBrandt8*>(mpCamera2)->mvLappingArea[1]);
 #else

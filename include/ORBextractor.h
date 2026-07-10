@@ -27,6 +27,14 @@
 #include <list>
 #include <string>
 
+// Number of physical hardware accelerator instances in the loaded bitstream.
+// Lives in this header (not ORBextractor.cc) because Frame.cc also needs it:
+// the stereo constructors launch parallel left/right extraction threads only
+// when a second instance exists, and fall back to the serialized pre-F.12
+// path when built with -DORB_HW_NUM_ACCELERATORS=1.
+#ifndef ORB_HW_NUM_ACCELERATORS
+#define ORB_HW_NUM_ACCELERATORS 2
+#endif
 
 namespace ORB_SLAM3
 {
