@@ -569,7 +569,9 @@ namespace top {
     // so the whole line reaches the log in one write. Since F.12 the two
     // accelerator instances log from concurrent left/right threads, and the run
     // scripts grep these lines -- a chained << would let fragments from both
-    // instances interleave mid-line.
+    // instances interleave mid-line. ALL driver console output (probe, DROPCNT
+    // canary, dump notice, and since 2026-07-10 the TRACE lines as well) must
+    // go through here.
     void LogLine(const string& line)
     {
         cerr << line + '\n';
@@ -636,11 +638,19 @@ namespace top {
                 throw runtime_error("mapped udmabuf1 is too small for one output record");
 
 #ifdef USE_HW_ACCEL_TRACE
+            // Trace lines go through LogLine too: chained << from the parallel
+            // left/right threads interleaves mid-line, which spliced unrelated
+            // numbers after "DROPCNT=" and tripped the run scripts' drop check
+            // as a false positive (2026-07-10 2x_fast batch).
             if(traceCount_ < 20)
-                cerr << "[USE_HW_ACCEL] begin level=" << level
-                     << ", image=" << image.cols << "x" << image.rows
-                     << ", inLen=" << inLen
-                     << ", outLen=" << outLen << endl;
+            {
+                ostringstream trace;
+                trace << "[USE_HW_ACCEL] begin level=" << level
+                      << ", image=" << image.cols << "x" << image.rows
+                      << ", inLen=" << inLen
+                      << ", outLen=" << outLen;
+                LogLine(trace.str());
+            }
 #endif
 
             PulseTopSoftReset(topRegs_);
@@ -653,7 +663,7 @@ namespace top {
 
 #ifdef USE_HW_ACCEL_TRACE
             if(traceCount_ < 20)
-                cerr << "[USE_HW_ACCEL] reset done level=" << level << endl;
+                LogLine("[USE_HW_ACCEL] reset done level=" + to_string(level));
 #endif
 
             CopyImageToMapped(inMap_.bytes(), image);
@@ -661,7 +671,7 @@ namespace top {
 
 #ifdef USE_HW_ACCEL_TRACE
             if(traceCount_ < 20)
-                cerr << "[USE_HW_ACCEL] input copied level=" << level << endl;
+                LogLine("[USE_HW_ACCEL] input copied level=" + to_string(level));
 #endif
 
             topRegs_.write32(top::WIDTH, static_cast<uint32_t>(image.cols));
@@ -735,7 +745,7 @@ namespace top {
 
 #ifdef USE_HW_ACCEL_TRACE
             if(traceCount_ < 20)
-                cerr << "[USE_HW_ACCEL] transfer started level=" << level << endl;
+                LogLine("[USE_HW_ACCEL] transfer started level=" + to_string(level));
 #endif
 
             const chrono::steady_clock::time_point start = chrono::steady_clock::now();
@@ -861,12 +871,16 @@ namespace top {
 
 #ifdef USE_HW_ACCEL_TRACE
             if(traceCount_ < 20)
-                cerr << "[USE_HW_ACCEL] done instance=" << index_
-                     << ", level=" << level
-                     << ", KPCOUNT=" << kpCount
-                     << ", kept=" << rawKeypoints.size()
-                     << ", DROPCNT=" << dropCount
-                     << ", STALLCNT=" << stallCycles << endl;
+            {
+                ostringstream trace;
+                trace << "[USE_HW_ACCEL] done instance=" << index_
+                      << ", level=" << level
+                      << ", KPCOUNT=" << kpCount
+                      << ", kept=" << rawKeypoints.size()
+                      << ", DROPCNT=" << dropCount
+                      << ", STALLCNT=" << stallCycles;
+                LogLine(trace.str());
+            }
             ++traceCount_;
 #endif
             return HwLevelStats{dmaResetUs, stallCycles};
