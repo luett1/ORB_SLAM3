@@ -23,9 +23,7 @@
 #include <list>
 #include <opencv2/opencv.hpp>
 
-//timing includes to measure each part of ORB
-#include <list>
-#include <string>
+#include <string>   // WriteTimingsCSV filename (REGISTER_TIMES_SUBSTAGE)
 
 // Number of physical hardware accelerator instances in the loaded bitstream.
 // Lives in this header (not ORBextractor.cc) because Frame.cc also needs it:
@@ -73,23 +71,23 @@ public:
                     std::vector<cv::KeyPoint>& _keypoints,
                     cv::OutputArray _descriptors, std::vector<int> &vLappingArea);
 
-	
-	#ifdef REGISTER_TIMES_SUBSTAGE
-	// Per-stage timing accumulators (microseconds, one entry per frame call)
-	std::vector<double> vdPyramid_us;
-	std::vector<double> vdFAST_us;
+#ifdef REGISTER_TIMES_SUBSTAGE
+    // Per-stage timing accumulators (microseconds, one entry per frame call).
+    // In HW builds vdFAST_us holds the accelerator round-trip instead of SW FAST.
+    std::vector<double> vdPyramid_us;
+    std::vector<double> vdFAST_us;
 #ifdef USE_HW_ACCEL
-	std::vector<double> vdHwDmaReset_us;
-	// STALLCNT summed over levels, one entry per frame: PL cycles the pixel
-	// stream was held off by corner-FIFO backpressure (cost of zero drops).
-	std::vector<double> vdHwStall_cycles;
+    std::vector<double> vdHwDmaReset_us;
+    // STALLCNT summed over levels, one entry per frame: PL cycles the pixel
+    // stream was held off by corner-FIFO backpressure (cost of zero drops).
+    std::vector<double> vdHwStall_cycles;
 #endif
-	std::vector<double> vdOctTree_us;
-	std::vector<double> vdOrient_us;
-	std::vector<double> vdDescriptors_us;
+    std::vector<double> vdOctTree_us;
+    std::vector<double> vdOrient_us;
+    std::vector<double> vdDescriptors_us;
 
-	void WriteTimingsCSV(const std::string& filename);
-	#endif
+    void WriteTimingsCSV(const std::string& filename);
+#endif
 
     int inline GetLevels(){
         return nlevels;}
@@ -148,3 +146,4 @@ protected:
 } //namespace ORB_SLAM
 
 #endif
+

@@ -59,6 +59,7 @@ src/Tracking.cc
 src/LocalMapping.cc
 src/LoopClosing.cc
 src/ORBextractor.cc
+src/ORBHwAccelerator.cc
 src/ORBmatcher.cc
 src/FrameDrawer.cc
 src/Converter.cc
@@ -87,6 +88,7 @@ include/Tracking.h
 include/LocalMapping.h
 include/LoopClosing.h
 include/ORBextractor.h
+include/ORBHwAccelerator.h
 include/ORBmatcher.h
 include/FrameDrawer.h
 include/Converter.h
