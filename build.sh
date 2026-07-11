@@ -1,3 +1,7 @@
+# Fork note: all -j levels reduced to -j1. The KR260 has 4 GB of RAM and
+# parallel compilation of the heavier translation units OOMs the board
+# (g++ gets killed); single-job builds are slow but reliable.
+
 echo "Configuring and building Thirdparty/DBoW2 ..."
 
 cd Thirdparty/DBoW2

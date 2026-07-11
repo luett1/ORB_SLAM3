@@ -1,5 +1,28 @@
 # ORB-SLAM3
 
+This fork (Master's thesis *On-device 3D Mapping*, M. Schieber, 2026) runs ORB-SLAM3
+on the AMD Kria KR260 with a custom VHDL accelerator in the programmable logic that
+replaces the software FAST detection, non-maximum suppression, per-cell corner
+selection and orientation of `ORBextractor` (pyramid, octree and descriptors stay on
+the CPU). All fork changes are kept out of the upstream files where possible:
+
+- `src/ORBHwAccelerator.cc` / `include/ORBHwAccelerator.h` (new): the complete
+  userspace driver (uio + u-dma-buf, AXI DMA sequencing, keypoint decoding); see the
+  header comment in the `.cc` for how the hardware is driven.
+- `src/ORBextractor.cc|.h`: `ComputeKeyPointsHardware()` (per-level accelerator call
+  in place of `ComputeKeyPointsOctTree()`), sub-stage timing instrumentation, and an
+  `hwAccelIndex` constructor argument selecting the accelerator instance.
+- `src/Frame.cc`, `src/Tracking.cc`: stereo left/right extraction on two parallel
+  accelerator instances (`ORB_HW_NUM_ACCELERATORS`, right extractor = instance 1).
+- `CMakeLists.txt` options: `USE_HW_ACCEL` (default ON), `USE_HW_ACCEL_TRACE`,
+  `REGISTER_TIMES`, `REGISTER_TIMES_SUBSTAGE` (all runtime-neutral when OFF);
+  C++11 -> C++14 (also in `Thirdparty/Sophus`).
+- `build.sh` uses `-j1` (4 GB RAM on the KR260), `Examples/Stereo/stereo_euroc.cc`
+  runs headless, `enable_DMA_access.sh` (new) prepares the uio/u-dma-buf devices.
+
+Runtime toggles: `ORB_HW_GATE=0` disables the PL strict-cell gate for A/B runs;
+`ORB_HW_DUMP=1` dumps the first level-0 frame for RTL testbench cross-checks.
+
 ### V1.0.1, May 18th, 2025
 Added a way to measure Sub-Stage ORB Timings. When enabled, an additional timing file, `ORBExtractorTimings.txt`, will be created that includes the timings in microseconds of:
 - Pyramid Building

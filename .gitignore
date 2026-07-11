@@ -93,12 +93,13 @@ borrar/*
 
 */ExecMean.txt
 
-
-
+# Fork additions: per-run outputs of the timing instrumentation and the
+# HW-accelerator debug dump (ORB_HW_DUMP=1), collected under timing_results/
+# by the run scripts.
 timing_results/
+ORBExtractorTimings*.txt
+hw_dump_L0.hex
 
-
-# ignore run.sh. its just a file for setting up multiple ORB_SLAM3 runs,
-# not a part of orbslam itself
-/run.sh
+# run.sh / run_*.sh are batch-experiment helpers staged at the repo root on
+# the KR260, not part of ORB-SLAM3 itself
 /run*

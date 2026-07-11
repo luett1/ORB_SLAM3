@@ -88,6 +88,7 @@ int main(int argc, char **argv)
     cout.precision(17);
 
     // Create SLAM system. It initializes all system threads and gets ready to process frames.
+    // Fork note: viewer disabled -- the KR260 runs headless (no display/Pangolin window).
     ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::STEREO, false);
 
     cv::Mat imLeft, imRight;
