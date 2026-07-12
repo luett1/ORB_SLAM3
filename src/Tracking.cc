@@ -31,6 +31,8 @@
 
 #include <iostream>
 
+#include <cmath>
+#include <limits>
 #include <mutex>
 #include <chrono>
 
@@ -133,23 +135,32 @@ Tracking::Tracking(System *pSys, ORBVocabulary* pVoc, FrameDrawer *pFrameDrawer,
 #ifdef REGISTER_TIMES
 double calcAverage(vector<double> v_times)
 {
+    // NaN entries mark frames where the stage did not run (see PadStageTimes)
     double accum = 0;
+    size_t total = 0;
     for(double value : v_times)
     {
+        if(std::isnan(value))
+            continue;
         accum += value;
+        total++;
     }
 
-    return accum / v_times.size();
+    return accum / total;
 }
 
 double calcDeviation(vector<double> v_times, double average)
 {
     double accum = 0;
+    size_t total = 0;
     for(double value : v_times)
     {
+        if(std::isnan(value))
+            continue;
         accum += pow(value - average, 2);
+        total++;
     }
-    return sqrt(accum / v_times.size());
+    return sqrt(accum / total);
 }
 
 double calcAverage(vector<int> v_values)
@@ -180,6 +191,25 @@ double calcDeviation(vector<int> v_values, double average)
     }
     return sqrt(accum / total);
 }
+
+#ifdef REGISTER_TIMES
+// Track() returns early on frames that skip pipeline stages (before map
+// initialization, on timestamp jumps, and on the LOST->reset frame), so the
+// per-stage vectors fall behind the per-frame vdORBExtract_ms/vdTrackTotal_ms
+// and TrackStats2File() would write column-shifted rows. Pad the skipped
+// entries with NaN after every frame; calcAverage/calcDeviation skip NaN, so
+// the reported statistics still cover only frames where the stage ran.
+static void PadStageTimes(Tracking &tracker)
+{
+    const size_t nFrames = tracker.vdORBExtract_ms.size();
+    const double skipped = std::numeric_limits<double>::quiet_NaN();
+    if(!tracker.vdIMUInteg_ms.empty())
+        tracker.vdIMUInteg_ms.resize(nFrames, skipped);
+    tracker.vdPosePred_ms.resize(nFrames, skipped);
+    tracker.vdLMTrack_ms.resize(nFrames, skipped);
+    tracker.vdNewKF_ms.resize(nFrames, skipped);
+}
+#endif
 
 void Tracking::LocalMapStats2File()
 {
@@ -1519,6 +1549,10 @@ Sophus::SE3f Tracking::GrabImageStereo(const cv::Mat &imRectLeft, const cv::Mat 
     Track();
     //cout << "Tracking end" << endl;
 
+#ifdef REGISTER_TIMES
+    PadStageTimes(*this);
+#endif
+
     return mCurrentFrame.GetPose();
 }
 
@@ -1564,6 +1598,10 @@ Sophus::SE3f Tracking::GrabImageRGBD(const cv::Mat &imRGB,const cv::Mat &imD, co
 #endif
 
     Track();
+
+#ifdef REGISTER_TIMES
+    PadStageTimes(*this);
+#endif
 
     return mCurrentFrame.GetPose();
 }
@@ -1616,6 +1654,10 @@ Sophus::SE3f Tracking::GrabImageMonocular(const cv::Mat &im, const double &times
 
     lastID = mCurrentFrame.mnId;
     Track();
+
+#ifdef REGISTER_TIMES
+    PadStageTimes(*this);
+#endif
 
     return mCurrentFrame.GetPose();
 }
