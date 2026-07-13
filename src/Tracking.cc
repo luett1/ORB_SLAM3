@@ -300,6 +300,12 @@ void Tracking::PrintTimeStats()
     if (mpORBextractorLeft) {
         mpORBextractorLeft->WriteTimingsCSV("ORBExtractorTimings.txt");
     }
+    // stereo only (null in mono); F.14: the right instance collects the same
+    // substage vectors every frame -- persist them so serial-vs-parallel runs
+    // expose per-stage CPU contention on both sides
+    if (mpORBextractorRight) {
+        mpORBextractorRight->WriteTimingsCSV("ORBExtractorTimingsRight.txt");
+    }
 	#endif
 
 
