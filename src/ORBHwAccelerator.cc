@@ -800,8 +800,8 @@ namespace top {
                 throw runtime_error("TOP cfg_error set");
             if((finalStatus & top::StatusOverflow) != 0)
                 throw runtime_error("TOP overflow set");
-            // Build 0xC0DE0002 stalls the pixel stream before the corner FIFO can
-            // fill, so tail-drop is structurally impossible. A nonzero DROPCNT means
+            // Builds since 0xC0DE0002 stall the pixel stream before the corner FIFO
+            // can fill, so tail-drop is structurally impossible. A nonzero DROPCNT means
             // the FIFO's PROG_FULL_GAP no longer covers the pipeline tail -- a real
             // hardware regression, so this canary warns in every build (rate-limited).
             if(dropCount != 0)

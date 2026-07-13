@@ -1340,8 +1340,9 @@ namespace ORB_SLAM3
 
 #ifdef REGISTER_TIMES_SUBSTAGE
     // Dump the accumulated per-frame sub-stage timings (thesis instrumentation).
-    // Called once at shutdown from Tracking::PrintTimeStats(); one CSV row per
-    // frame processed by this (the left/mono) extractor.
+    // Called once per extractor instance at shutdown from Tracking::PrintTimeStats()
+    // (left/mono -> ORBExtractorTimings.txt, stereo right -> ORBExtractorTimingsRight.txt);
+    // one CSV row per frame processed by this extractor.
     void ORBextractor::WriteTimingsCSV(const std::string& filename)
     {
         std::ofstream f(filename);
